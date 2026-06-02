@@ -524,6 +524,9 @@ const db = new DatabaseService();
 const THEME_STORAGE_KEY = 'lazisnu_theme_core';
 const SESSION_STORAGE_KEY = 'lazisnu_current_user';
 const LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view';
+const LAST_BACKGROUND_STORAGE_KEY = 'lazisnu_last_background_at';
+// 30 detik untuk testing. Naikkan ke 10-15 menit untuk production jika dibutuhkan.
+const SESSION_BACKGROUND_TIMEOUT_MS = 30000;
 const RESTORABLE_VIEWS = ['dashboard', 'sales', 'products', 'reports', 'users', 'profit-settings', 'spreadsheet'];
 const INTERNAL_HISTORY_VIEWS = ['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'];
 
@@ -544,6 +547,22 @@ const getInitialTheme = () => {
 const clearStoredSession = () => {
   localStorage.removeItem(SESSION_STORAGE_KEY);
   localStorage.removeItem(LAST_VIEW_STORAGE_KEY);
+};
+
+const clearBackgroundTimestamp = () => {
+  localStorage.removeItem(LAST_BACKGROUND_STORAGE_KEY);
+};
+
+const markAppBackgrounded = () => {
+  if (localStorage.getItem(SESSION_STORAGE_KEY)) {
+    localStorage.setItem(LAST_BACKGROUND_STORAGE_KEY, Date.now().toString());
+  }
+};
+
+const hasBackgroundSessionTimedOut = () => {
+  const lastBackgroundAt = Number(localStorage.getItem(LAST_BACKGROUND_STORAGE_KEY) || 0);
+
+  return lastBackgroundAt > 0 && Date.now() - lastBackgroundAt > SESSION_BACKGROUND_TIMEOUT_MS;
 };
 
 const isRestorableView = (view, user) => {
@@ -577,11 +596,12 @@ const getInitialSessionState = () => {
     const storedUser = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || 'null');
     const validUser = validateStoredUser(storedUser);
 
-    if (!validUser) {
+    if (!validUser || hasBackgroundSessionTimedOut()) {
       clearStoredSession();
       return { user: null, view: 'welcome' };
     }
 
+    clearBackgroundTimestamp();
     return { user: validUser, view: getSafeRestoredView(validUser) };
   } catch {
     clearStoredSession();
@@ -615,6 +635,28 @@ const Toast = ({ message, type = 'success', onClose }) => {
     </div>
   );
 };
+
+const SplashScreen = () => (
+  <div className="min-h-[100dvh] bg-[#020617] text-white flex items-center justify-center px-6 overflow-hidden relative">
+    <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(5,150,105,0.24),transparent_34%),radial-gradient(circle_at_30%_20%,rgba(20,184,166,0.14),transparent_28%)]" />
+    <div className="absolute w-72 h-72 rounded-full bg-emerald-500/10 blur-3xl animate-pulse" />
+    <div className="relative z-10 flex flex-col items-center text-center">
+      <div className="relative mb-6">
+        <div className="absolute inset-0 rounded-[2rem] bg-emerald-400/25 blur-2xl animate-pulse" />
+        <div className="relative w-24 h-24 md:w-28 md:h-28 rounded-[2rem] bg-white/95 border border-emerald-300/30 shadow-2xl shadow-emerald-950/40 p-3 flex items-center justify-center">
+          <img src="/app-icon.png" alt="LAZISNU POS" className="w-full h-full object-contain" />
+        </div>
+      </div>
+      <h1 className="text-3xl md:text-4xl font-black tracking-tight">LAZISNU POS</h1>
+      <p className="mt-2 text-sm md:text-base font-medium text-emerald-100/80">Aplikasi Penjualan LAZISNU Garut</p>
+      <div className="mt-8 flex items-center gap-2" aria-label="Memuat aplikasi">
+        <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-bounce [animation-delay:-0.2s]" />
+        <span className="w-2.5 h-2.5 rounded-full bg-emerald-300 animate-bounce [animation-delay:-0.1s]" />
+        <span className="w-2.5 h-2.5 rounded-full bg-emerald-200 animate-bounce" />
+      </div>
+    </div>
+  </div>
+);
 
 const Button = ({ children, variant = 'primary', className = '', isLoading, ...props }) => {
   // Mobile touch target min-height: 48px
@@ -2207,6 +2249,7 @@ export default function App() {
   const [invoiceData, setInvoiceData] = useState(null);
   const [invoiceBackView, setInvoiceBackView] = useState('sales');
   const [theme, setTheme] = useState(getInitialTheme);
+  const [isBooting, setIsBooting] = useState(true);
   const viewRef = useRef(view);
   const userRef = useRef(user);
   const invoiceBackViewRef = useRef(invoiceBackView);
@@ -2221,6 +2264,11 @@ export default function App() {
 
   const showToast = (message, type = 'success') => setToast({ message, type });
   const closeToast = () => setToast(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setIsBooting(false), 750);
+    return () => clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     viewRef.current = view;
@@ -2292,32 +2340,48 @@ export default function App() {
     if (!user) return undefined;
 
     const validateActiveSession = () => {
-      if (!localStorage.getItem(SESSION_STORAGE_KEY) || !validateStoredUser(user)) {
+      if (!localStorage.getItem(SESSION_STORAGE_KEY) || !validateStoredUser(user) || hasBackgroundSessionTimedOut()) {
         clearStoredSession();
         setUser(null);
         setView('welcome');
+        setToast({ message: 'Sesi berakhir. Silakan masuk kembali.', type: 'error' });
+      } else {
+        clearBackgroundTimestamp();
       }
     };
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        markAppBackgrounded();
+      } else {
+        validateActiveSession();
+      }
+    };
+
+    const handlePageShow = () => validateActiveSession();
 
     const handleStorageChange = (event) => {
       if ([SESSION_STORAGE_KEY, 'lazisnu_core_users'].includes(event.key)) validateActiveSession();
     };
 
-    const handleVisibilityChange = () => {
-      if (!document.hidden) validateActiveSession();
-    };
-
     window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('blur', markAppBackgrounded);
     window.addEventListener('focus', validateActiveSession);
+    window.addEventListener('pagehide', markAppBackgrounded);
+    window.addEventListener('pageshow', handlePageShow);
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('blur', markAppBackgrounded);
       window.removeEventListener('focus', validateActiveSession);
+      window.removeEventListener('pagehide', markAppBackgrounded);
+      window.removeEventListener('pageshow', handlePageShow);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [user]);
 
   const handleLoginSuccess = (userData) => {
+    clearBackgroundTimestamp();
     localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(userData));
     setUser(userData);
     showToast(`Selamat datang, ${userData.name}`);
@@ -2365,23 +2429,26 @@ export default function App() {
     <div className={theme === 'dark' ? 'dark' : ''}>
       <AppContext.Provider value={{ user, showToast, theme, toggleTheme }}>
         <div className="min-h-[100dvh] overflow-x-hidden bg-slate-50 dark:bg-[#070b14] text-slate-900 dark:text-slate-200 transition-colors duration-300 flex flex-col">
-          
-          {view === 'welcome' && <WelcomeView onNext={() => setView('login')} />}
-          {view === 'login' && <LoginView onLoginSuccess={handleLoginSuccess} showToast={showToast} />}
-          {view === 'modules' && <ModuleSelectionView onSelectModule={setView} showToast={showToast} />}
-          
-          {['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'].includes(view) && user && (
-            <DashboardLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
-              {view === 'dashboard' && <DashboardOverview />}
-              {view === 'products' && <ProductsView showToast={showToast} />}
-              {view === 'users' && user.role === 'owner' && <UsersView showToast={showToast} />}
-              {view === 'sales' && <SalesView showToast={showToast} setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} />}
-              {view === 'reports' && <ReportsView setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} showToast={showToast} />}
-              {view === 'profit-settings' && user.role === 'owner' && <ProfitSettingsView showToast={showToast} />}
-              {view === 'spreadsheet' && <SpreadsheetView showToast={showToast} />}
-              {view === 'invoice' && <InvoiceView invoiceData={invoiceData} setView={setView} backView={invoiceBackView} />}
-            </DashboardLayout>
-          )}
+          {isBooting ? (
+            <SplashScreen />
+          ) : <>
+            {view === 'welcome' && <WelcomeView onNext={() => setView('login')} />}
+            {view === 'login' && <LoginView onLoginSuccess={handleLoginSuccess} showToast={showToast} />}
+            {view === 'modules' && <ModuleSelectionView onSelectModule={setView} showToast={showToast} />}
+            
+            {['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'].includes(view) && user && (
+              <DashboardLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
+                {view === 'dashboard' && <DashboardOverview />}
+                {view === 'products' && <ProductsView showToast={showToast} />}
+                {view === 'users' && user.role === 'owner' && <UsersView showToast={showToast} />}
+                {view === 'sales' && <SalesView showToast={showToast} setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} />}
+                {view === 'reports' && <ReportsView setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} showToast={showToast} />}
+                {view === 'profit-settings' && user.role === 'owner' && <ProfitSettingsView showToast={showToast} />}
+                {view === 'spreadsheet' && <SpreadsheetView showToast={showToast} />}
+                {view === 'invoice' && <InvoiceView invoiceData={invoiceData} setView={setView} backView={invoiceBackView} />}
+              </DashboardLayout>
+            )}
+          </>}
 
           {toast && <Toast message={toast.message} type={toast.type} onClose={closeToast} />}
         </div>
