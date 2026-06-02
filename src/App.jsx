@@ -1,6 +1,6 @@
 import { useState, useEffect, createContext, useContext } from 'react';
-import logoWhite from '../../LOGO LAZISNU PUTIH.png';
-import logoColor from '../../LOGO LAZISNU WARNA.png';
+import logoWhite from './assets/LOGO LAZISNU PUTIH.png';
+import logoColor from './assets/LOGO LAZISNU WARNA.png';
 import { 
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
