@@ -21,6 +21,11 @@ import {
   checkUserHasTransactions,
   updateUserInDb
 } from './services/database/dbUserService';
+import {
+  createTransactionInDb,
+  syncTransactionsCacheFromDb,
+  updateTransactionSyncStatusInDb
+} from './services/database/dbTransactionService';
 import { 
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
@@ -336,7 +341,81 @@ class DatabaseService {
   }
 
   getTransactions() { return this._get('transactions'); }
-  
+
+  setTransactions(transactions) { this._set('transactions', transactions); }
+
+  buildTransaction(txData) {
+    const products = this.getProducts();
+    const requestedItems = Array.isArray(txData.items) && txData.items.length > 0
+      ? txData.items
+      : [{ productId: txData.productId, qty: txData.qty }];
+    const items = requestedItems.map(item => {
+      const productIndex = products.findIndex(p => p.id === item.productId);
+
+      if (productIndex === -1) throw new Error('Produk tidak ditemukan.');
+
+      const selectedProduct = products[productIndex];
+      const qty = Number(item.qty) || 0;
+
+      if (qty < 1) throw new Error('Qty tidak valid.');
+      if (selectedProduct.stock < qty) throw new Error('Stok tidak mencukupi.');
+
+      const priceSnapshot = Number(selectedProduct.price) || 0;
+
+      return {
+        productIndex,
+        productId: selectedProduct.id,
+        productNameSnapshot: selectedProduct.name || '-',
+        productCategorySnapshot: selectedProduct.category || '-',
+        productSizeSnapshot: selectedProduct.size || '-',
+        priceSnapshot,
+        qty,
+        subtotal: priceSnapshot * qty
+      };
+    });
+    const totalRequestedByProduct = items.reduce((acc, item) => {
+      acc[item.productId] = (acc[item.productId] || 0) + item.qty;
+      return acc;
+    }, {});
+
+    Object.entries(totalRequestedByProduct).forEach(([productId, totalQty]) => {
+      const product = products.find(p => p.id === productId);
+      if (!product || product.stock < totalQty) throw new Error('Stok tidak mencukupi.');
+    });
+
+    const total = items.reduce((sum, item) => sum + item.subtotal, 0);
+    const profitSharing = calculateProfitSharing(total, this.getProfitSharingSettings());
+    const firstItem = items[0];
+
+    return {
+      id: `TX-${Date.now()}`,
+      date: new Date().toISOString(),
+      buyerName: txData.buyerName || 'Hamba Allah',
+      productId: firstItem.productId,
+      productName: firstItem.productNameSnapshot,
+      productNameSnapshot: firstItem.productNameSnapshot,
+      productCategorySnapshot: firstItem.productCategorySnapshot,
+      productSizeSnapshot: firstItem.productSizeSnapshot,
+      price: firstItem.priceSnapshot,
+      priceSnapshot: firstItem.priceSnapshot,
+      petugasId: txData.petugasId || null,
+      namaPetugasSnapshot: txData.namaPetugasSnapshot || '-',
+      roleSnapshot: txData.roleSnapshot || '-',
+      qty: items.reduce((sum, item) => sum + item.qty, 0),
+      items: items.map(item => {
+        const transactionItem = { ...item };
+        delete transactionItem.productIndex;
+        return transactionItem;
+      }),
+      total,
+      paymentMethod: txData.paymentMethod || 'Tunai',
+      notes: txData.notes || '',
+      ...profitSharing,
+      syncStatus: 'pending',
+      syncedAt: null
+    };
+  }
+
   addTransaction(txData) {
     const products = this.getProducts();
     const requestedItems = Array.isArray(txData.items) && txData.items.length > 0
@@ -686,6 +765,13 @@ const loginWithDbFallback = async (username, password, role) => {
 
   const localUser = db.login(normalizedUsername, password, role);
   return { user: localUser, source: 'local' };
+};
+
+const refreshTransactionsCacheWithFallback = async () => {
+  const result = await syncTransactionsCacheFromDb();
+  if (result.success) return { data: result.data, source: 'database' };
+
+  return { data: db.getTransactions(), source: 'local', status: result.status, error: result.error };
 };
 
 // ============================================================================
@@ -1897,7 +1983,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
 
     setIsSubmitting(true);
     try {
-      const newTx = db.addTransaction({
+      const txPayload = {
         buyerName: form.buyerName,
         items: cartItems.map(item => ({ productId: item.productId, qty: item.qty })),
         paymentMethod: form.paymentMethod, 
@@ -1905,26 +1991,40 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         petugasId: user.id,
         namaPetugasSnapshot: user.name,
         roleSnapshot: user.role
-      }); 
-
-      let stockUpdateFailed = false;
+      };
       const health = await checkDatabaseConnection();
+      let newTx;
+
       if (health.status === 'connected') {
+        const productsResult = await syncProductsCacheFromDb();
+        if (!productsResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
+
+        const transactionDraft = db.buildTransaction(txPayload);
+        const createResult = await createTransactionInDb(transactionDraft);
+        if (!createResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
+
         const latestProducts = db.getProducts();
-        const updatedProductIds = [...new Set(cartItems.map(item => item.productId))];
-        const stockResults = await Promise.all(updatedProductIds.map(async (productId) => {
-          const latestProduct = latestProducts.find(product => product.id === productId || product.localId === productId);
+        const qtyByProductId = transactionDraft.items.reduce((acc, item) => {
+          acc[item.productId] = (acc[item.productId] || 0) + item.qty;
+          return acc;
+        }, {});
+        const stockResults = await Promise.all(Object.entries(qtyByProductId).map(([productId, totalQty]) => {
+          const latestProduct = latestProducts.find(product => product.id === productId);
           if (!latestProduct) return { success: false };
 
-          return updateProductStockInDb(latestProduct.id, latestProduct.stock);
+          return updateProductStockInDb(latestProduct.id, latestProduct.stock - totalQty);
         }));
 
-        stockUpdateFailed = stockResults.some(result => !result.success);
-        if (!stockUpdateFailed) await syncProductsCacheFromDb();
+        if (stockResults.some(result => !result.success)) throw new Error('Gagal menyimpan transaksi ke database.');
+
+        await Promise.all([syncProductsCacheFromDb(), syncTransactionsCacheFromDb()]);
+        newTx = createResult.data;
+      } else {
+        newTx = db.addTransaction(txPayload);
       }
 
       setProducts(sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
-      showToast(stockUpdateFailed ? 'Transaksi tersimpan lokal, tetapi stok database gagal diperbarui.' : 'Transaksi berhasil disimpan', stockUpdateFailed ? 'error' : 'success');
+      showToast('Transaksi berhasil disimpan');
       setInvoiceData(newTx);
       setInvoiceBackView('sales');
       setView('invoice');
@@ -2166,13 +2266,30 @@ const ProfitSettingsView = ({ showToast }) => {
 };
 
 const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast }) => {
-  const [transactions] = useState(() => db.getTransactions());
+  const [transactions, setTransactions] = useState(() => db.getTransactions());
+  const [transactionSource, setTransactionSource] = useState('Lokal');
   const [activeReportTab, setActiveReportTab] = useState('history');
   const [periodFilter, setPeriodFilter] = useState('all');
   const [officerFilter, setOfficerFilter] = useState('all');
   const [selectedOfficerName, setSelectedOfficerName] = useState(null);
   const [customStartDate, setCustomStartDate] = useState(formatDateInput(new Date()));
   const [customEndDate, setCustomEndDate] = useState(formatDateInput(new Date()));
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await refreshTransactionsCacheWithFallback();
+
+      if (!isMounted) return;
+      setTransactions(result.data);
+      setTransactionSource(result.source === 'database' ? 'Database' : 'Lokal');
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const periodBounds = getPeriodBounds(periodFilter, customStartDate, customEndDate);
   const officerOptions = db.getUsers().filter(item => item.role === 'admin').map(item => item.name);
@@ -2361,6 +2478,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
         <div>
           <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Laporan & Laba</h1>
           <p className="text-sm text-slate-500 mt-1.5">Pantau riwayat transaksi dan bagi hasil.</p>
+          <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Transaksi: {transactionSource}</p>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 w-full lg:w-auto">
           <select value={periodFilter} onChange={e => setPeriodFilter(e.target.value)} className="bg-white dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 min-h-[44px] text-sm font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus:border-emerald-500">
@@ -2575,7 +2693,26 @@ const SpreadsheetView = ({ showToast }) => {
     message: 'Belum dicek.'
   });
 
-  const checkPending = () => setPendingCount(db.getPendingSyncs().length);
+  const checkPending = async () => {
+    const result = await refreshTransactionsCacheWithFallback();
+    const pendingTransactions = result.data.filter(tx => tx.syncStatus === 'pending');
+    setPendingCount(pendingTransactions.length);
+    return { ...result, pendingTransactions };
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await refreshTransactionsCacheWithFallback();
+      if (!isMounted) return;
+      setPendingCount(result.data.filter(tx => tx.syncStatus === 'pending').length);
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const handleSaveUrl = () => {
     if (!webAppUrl.trim()) return showToast('Masukkan URL Google Apps Script terlebih dahulu.', 'error');
@@ -2638,18 +2775,61 @@ const SpreadsheetView = ({ showToast }) => {
   const handleSync = async () => {
     if (isSubmitting) return; // Mencegah double submit
     if (!webAppUrl.trim()) return showToast('Masukkan URL Google Apps Script terlebih dahulu.', 'error');
-    if (pendingCount === 0) return showToast('Tidak ada transaksi baru untuk disinkronkan.', 'success');
     
     setIsSubmitting(true);
     setLastStatus('Mengirim data ke Google Sheets...');
     try {
       db.saveSpreadsheetUrl(webAppUrl);
-      const res = await db.syncToSpreadsheet(webAppUrl);
+
+      const health = await checkDatabaseConnection();
+      let res;
+
+      if (health.status === 'connected') {
+        const { pendingTransactions } = await checkPending();
+        if (pendingTransactions.length === 0) {
+          res = { success: true, message: 'Tidak ada transaksi baru untuk disinkronkan.', count: 0, rows: 0, syncedAt: new Date().toISOString() };
+        } else {
+          const endpoint = webAppUrl.trim();
+          const parsedUrl = new URL(endpoint);
+          if (!['http:', 'https:'].includes(parsedUrl.protocol) || !parsedUrl.pathname.endsWith('/exec')) {
+            throw new Error('URL Google Apps Script tidak valid. Pastikan memakai URL Web App yang diakhiri /exec.');
+          }
+
+          const now = new Date().toISOString();
+          const rowsToSync = db.getSpreadsheetRows(pendingTransactions, now);
+          if (rowsToSync.length === 0) throw new Error('Tidak ada data transaksi yang bisa dikirim.');
+
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            body: JSON.stringify({ rows: rowsToSync })
+          });
+          const responseText = await response.text();
+          if (!response.ok) throw new Error('Apps Script gagal memproses data. Periksa deployment Web App dan izin aksesnya.');
+
+          let sheetResult;
+          try {
+            sheetResult = JSON.parse(responseText);
+          } catch (error) {
+            throw new Error('Response Spreadsheet tidak valid. Pastikan URL Web App Apps Script benar.', { cause: error });
+          }
+
+          if (!sheetResult.success) throw new Error(sheetResult.message || 'Apps Script mengembalikan status gagal. Periksa log Apps Script.');
+
+          const statusResults = await Promise.all(pendingTransactions.map(tx => updateTransactionSyncStatusInDb(tx.dbId || tx.id, 'synced', now)));
+          if (statusResults.some(result => !result.success)) throw new Error('Spreadsheet berhasil diupdate, tetapi status sync database gagal diperbarui.');
+
+          await syncTransactionsCacheFromDb();
+          res = { success: true, message: `${pendingTransactions.length} transaksi berhasil ditambahkan ke Spreadsheet.`, count: pendingTransactions.length, rows: rowsToSync.length, syncedAt: now };
+        }
+      } else {
+        res = await db.syncToSpreadsheet(webAppUrl);
+      }
+
       showToast(res.message, 'success');
       setLastStatus(`${res.rows || 0} baris berhasil ditambahkan ke spreadsheet.`);
       setLastSync(res.syncedAt);
-      localStorage.setItem('lazisnu_last_sync_core', res.syncedAt);
-      checkPending();
+      if (res.syncedAt) localStorage.setItem('lazisnu_last_sync_core', res.syncedAt);
+      await checkPending();
     } catch (err) {
       setLastStatus(`${err.message} Data tetap pending dan aman.`);
       showToast(err.message, 'error');
