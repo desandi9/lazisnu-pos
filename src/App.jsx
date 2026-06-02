@@ -4,6 +4,15 @@ import logoColor from './assets/LOGO LAZISNU WARNA.png';
 import { checkDatabaseConnection } from './services/database/dbHealthService';
 import { migrateLocalDataToSupabase } from './services/database/dbMigrationService';
 import {
+  checkProductHasTransactions,
+  createProductInDb,
+  deleteProductFromDb,
+  setProductActiveInDb,
+  syncProductsCacheFromDb,
+  updateProductInDb,
+  updateProductStockInDb
+} from './services/database/dbProductService';
+import {
   createUserInDb,
   deleteUserFromDb,
   getUserByUsernameFromDb,
@@ -1556,12 +1565,57 @@ const ProductsView = ({ showToast }) => {
 
   const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts()));
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
+  const [productSource, setProductSource] = useState('Lokal');
   const [formData, setFormData] = useState(createProductFormData);
 
   const loadProducts = () => setProducts(sortProductsByCategory(db.getProducts()));
 
-  const handleSave = (e) => {
+  const refreshProducts = async () => {
+    const result = await syncProductsCacheFromDb();
+
+    if (result.success) {
+      const nextProducts = sortProductsByCategory(result.data);
+      setProducts(nextProducts);
+      setProductSource('Database');
+      return nextProducts;
+    }
+
+    const localProducts = sortProductsByCategory(db.getProducts());
+    setProducts(localProducts);
+    setProductSource('Lokal');
+    if (result.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal.', 'error');
+
+    return localProducts;
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await syncProductsCacheFromDb();
+
+      if (!isMounted) return;
+
+      if (result.success) {
+        setProducts(sortProductsByCategory(result.data));
+        setProductSource('Database');
+        return;
+      }
+
+      setProducts(sortProductsByCategory(db.getProducts()));
+      setProductSource('Lokal');
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleSave = async (e) => {
     e.preventDefault();
+    if (isSubmittingProduct) return;
+
     if (!formData.name.trim()) return showToast('Nama produk wajib diisi', 'error');
     if (!formData.category) return showToast('Kategori produk wajib dipilih', 'error');
     if (!formData.size.trim()) return showToast('Ukuran produk wajib diisi', 'error');
@@ -1569,24 +1623,108 @@ const ProductsView = ({ showToast }) => {
     if (Number(formData.stock) < 0) return showToast('Stok tidak boleh negatif', 'error');
     if (Number(formData.minStock) < 0) return showToast('Stok minimum tidak boleh negatif', 'error');
 
-    db.saveProduct({
-      ...formData,
+    const productPayload = {
       name: formData.name.trim(),
+      category: formData.category,
       size: formData.size.trim(),
       price: Number(formData.price),
       stock: Number(formData.stock),
-      minStock: Number(formData.minStock)
-    });
-    showToast('Produk tersimpan');
-    setIsModalOpen(false);
-    loadProducts();
+      minStock: Number(formData.minStock),
+      isActive: formData.isActive
+    };
+
+    setIsSubmittingProduct(true);
+    try {
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const result = formData.id
+          ? await updateProductInDb(formData.id, productPayload)
+          : await createProductInDb(productPayload);
+
+        if (!result.success) throw new Error(formData.id ? 'Gagal memperbarui produk di database.' : 'Gagal menyimpan produk ke database.');
+
+        await refreshProducts();
+      } else {
+        db.saveProduct({ ...formData, ...productPayload });
+        loadProducts();
+        setProductSource('Lokal');
+        if (health.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal.', 'error');
+      }
+
+      showToast('Produk tersimpan');
+      setIsModalOpen(false);
+    } catch (err) {
+      showToast(err.message || 'Gagal menyimpan produk.', 'error');
+    } finally {
+      setIsSubmittingProduct(false);
+    }
   };
 
-  const handleDelete = (id) => {
-    if (window.confirm('Apakah Anda yakin ingin menghapus produk ini?')) {
-      db.deleteProduct(id);
+  const productHasLocalTransactions = (product) => db.getTransactions().some(tx => (
+    tx.productId === product.id
+    || tx.productId === product.localId
+    || tx.productNameSnapshot === product.name
+    || (Array.isArray(tx.items) && tx.items.some(item => item.productId === product.id || item.productId === product.localId || item.productNameSnapshot === product.name))
+  ));
+
+  const ensureProductCanBeDeleted = async (product, health) => {
+    if (productHasLocalTransactions(product)) {
+      throw new Error('Produk ini sudah memiliki riwayat transaksi. Nonaktifkan saja agar laporan tetap aman.');
+    }
+
+    if (health.status === 'connected') {
+      const txResult = await checkProductHasTransactions(product);
+      if (!txResult.success) throw new Error(txResult.error || 'Gagal mengecek transaksi produk.');
+      if (txResult.data) throw new Error('Produk ini sudah memiliki riwayat transaksi. Nonaktifkan saja agar laporan tetap aman.');
+    }
+  };
+
+  const handleActiveChange = async (product) => {
+    const nextActive = !product.isActive;
+
+    try {
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const result = await setProductActiveInDb(product.id, nextActive);
+        if (!result.success) throw new Error('Gagal memperbarui produk di database.');
+
+        await refreshProducts();
+      } else {
+        db.saveProduct({ ...product, isActive: nextActive });
+        loadProducts();
+        setProductSource('Lokal');
+        if (health.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal.', 'error');
+      }
+
+      showToast(nextActive ? 'Produk diaktifkan kembali' : 'Produk dinonaktifkan');
+    } catch (err) {
+      showToast(err.message || 'Gagal memperbarui produk.', 'error');
+    }
+  };
+
+  const handleDelete = async (product) => {
+    if (!window.confirm('Apakah Anda yakin ingin menghapus produk ini?')) return;
+
+    try {
+      const health = await checkDatabaseConnection();
+      await ensureProductCanBeDeleted(product, health);
+
+      if (health.status === 'connected') {
+        const result = await deleteProductFromDb(product.id);
+        if (!result.success) throw new Error('Gagal menghapus produk dari database.');
+
+        await refreshProducts();
+      } else {
+        db.deleteProduct(product.id);
+        loadProducts();
+        setProductSource('Lokal');
+      }
+
       showToast('Produk berhasil dihapus');
-      loadProducts();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghapus produk.', 'error');
     }
   };
 
@@ -1596,6 +1734,7 @@ const ProductsView = ({ showToast }) => {
         <div>
           <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Data Produk</h1>
           <p className="text-sm text-slate-500 mt-1.5">Kelola master data stiker dan pantau stok.</p>
+          <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Produk: {productSource}</p>
         </div>
         {canManageProducts && <Button onClick={() => { setFormData(createProductFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto shadow-lg"><Plus size={20} /> Tambah Produk</Button>}
       </header>
@@ -1637,9 +1776,12 @@ const ProductsView = ({ showToast }) => {
                     </span>
                   </td>
                   {canManageProducts && (
-                    <td className="p-4 text-right flex justify-end gap-2">
-                      <button onClick={() => { setFormData(createProductFormData(p)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button>
-                      <button onClick={() => handleDelete(p.id)} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Trash2 size={18} /></button>
+                    <td className="p-4 text-right">
+                      <div className="flex flex-wrap justify-end gap-2">
+                        <button onClick={() => { setFormData(createProductFormData(p)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button>
+                        <button onClick={() => handleActiveChange(p)} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 ${p.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{p.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button>
+                        <button onClick={() => handleDelete(p)} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Trash2 size={18} /></button>
+                      </div>
                     </td>
                   )}
                 </tr>
@@ -1676,7 +1818,7 @@ const ProductsView = ({ showToast }) => {
 
               <div className="flex gap-3 pt-4">
                 <Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button>
-                <Button type="submit" className="flex-1 shadow-lg shadow-emerald-600/20">Simpan Data</Button>
+                <Button type="submit" isLoading={isSubmittingProduct} className="flex-1 shadow-lg shadow-emerald-600/20">Simpan Data</Button>
               </div>
             </form>
           </Card>
@@ -1688,10 +1830,26 @@ const ProductsView = ({ showToast }) => {
 
 const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) => {
   const { user } = useContext(AppContext);
-  const [products] = useState(() => sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
+  const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [form, setForm] = useState({ buyerName: '', productId: '', qty: 1, paymentMethod: 'Tunai', notes: '' });
   const [cartItems, setCartItems] = useState([]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await syncProductsCacheFromDb();
+      const sourceProducts = result.success ? result.data : db.getProducts();
+
+      if (!isMounted) return;
+      setProducts(sortProductsByCategory(sourceProducts.filter(p => p.isActive && p.stock > 0)));
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const selectedProduct = products.find(p => p.id === form.productId);
   const selectedQty = Number(form.qty) || 1;
@@ -1732,7 +1890,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
     setCartItems(prev => prev.filter(item => item.productId !== productId));
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (isSubmitting) return; // Mencegah double submit
     if (cartItems.length === 0) return showToast('Keranjang transaksi masih kosong', 'error');
@@ -1748,8 +1906,25 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         namaPetugasSnapshot: user.name,
         roleSnapshot: user.role
       }); 
-      
-      showToast('Transaksi berhasil disimpan');
+
+      let stockUpdateFailed = false;
+      const health = await checkDatabaseConnection();
+      if (health.status === 'connected') {
+        const latestProducts = db.getProducts();
+        const updatedProductIds = [...new Set(cartItems.map(item => item.productId))];
+        const stockResults = await Promise.all(updatedProductIds.map(async (productId) => {
+          const latestProduct = latestProducts.find(product => product.id === productId || product.localId === productId);
+          if (!latestProduct) return { success: false };
+
+          return updateProductStockInDb(latestProduct.id, latestProduct.stock);
+        }));
+
+        stockUpdateFailed = stockResults.some(result => !result.success);
+        if (!stockUpdateFailed) await syncProductsCacheFromDb();
+      }
+
+      setProducts(sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
+      showToast(stockUpdateFailed ? 'Transaksi tersimpan lokal, tetapi stok database gagal diperbarui.' : 'Transaksi berhasil disimpan', stockUpdateFailed ? 'error' : 'success');
       setInvoiceData(newTx);
       setInvoiceBackView('sales');
       setView('invoice');
