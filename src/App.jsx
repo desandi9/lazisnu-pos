@@ -1,11 +1,11 @@
-import { useState, useEffect, createContext, useContext } from 'react';
+import { useState, useEffect, useRef, createContext, useContext } from 'react';
 import logoWhite from './assets/LOGO LAZISNU PUTIH.png';
 import logoColor from './assets/LOGO LAZISNU WARNA.png';
 import { 
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
   LogOut, Plus, Edit2, Trash2, AlertTriangle, CheckCircle2, 
-  Printer, X, Menu, RefreshCcw, Info, Sun, Moon, Receipt, PieChart, Download, Settings
+  Printer, X, Menu, RefreshCcw, Info, Sun, Moon, Receipt, PieChart, Download, Settings, Eye, EyeOff
 } from 'lucide-react';
 
 // ============================================================================
@@ -49,6 +49,21 @@ const DEFAULT_USERS = [
 ].map(user => ({ ...user, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
 
 const getCategoryCode = (category) => PRODUCT_CATEGORIES.find(item => item.value === category)?.code || '-';
+const PRODUCT_CATEGORY_ORDER = PRODUCT_CATEGORIES.reduce((acc, item, index) => {
+  acc[item.value] = index;
+  return acc;
+}, {});
+const sortProductsByCategory = (products) => products.slice().sort((a, b) => {
+  const categoryA = PRODUCT_CATEGORY_ORDER[a.category] ?? 99;
+  const categoryB = PRODUCT_CATEGORY_ORDER[b.category] ?? 99;
+
+  if (categoryA !== categoryB) return categoryA - categoryB;
+
+  const nameCompare = (a.name || '').localeCompare(b.name || '', 'id-ID', { sensitivity: 'base' });
+  if (nameCompare !== 0) return nameCompare;
+
+  return (a.size || '').localeCompare(b.size || '', 'id-ID', { sensitivity: 'base' });
+});
 const getRoleLabel = (role) => USER_ROLES.find(item => item.value === role)?.label || '-';
 const getStatusLabel = (status) => USER_STATUSES.find(item => item.value === status)?.label || '-';
 const getTransactionPrice = (tx) => tx.priceSnapshot ?? tx.price ?? 0;
@@ -510,6 +525,7 @@ const THEME_STORAGE_KEY = 'lazisnu_theme_core';
 const SESSION_STORAGE_KEY = 'lazisnu_current_user';
 const LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view';
 const RESTORABLE_VIEWS = ['dashboard', 'sales', 'products', 'reports', 'users', 'profit-settings', 'spreadsheet'];
+const INTERNAL_HISTORY_VIEWS = ['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'];
 
 const applyTheme = (theme) => {
   document.documentElement.classList.toggle('dark', theme === 'dark');
@@ -629,6 +645,33 @@ const Input = ({ label, error, readOnly, className = '', ...props }) => (
     {error && <p className="text-xs text-red-500 font-medium">{error}</p>}
   </div>
 );
+
+const PasswordInput = ({ label, error, readOnly, className = '', ...props }) => {
+  const [isVisible, setIsVisible] = useState(false);
+
+  return (
+    <div className="space-y-2">
+      {label && <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">{label}</label>}
+      <div className="relative">
+        <input
+          type={isVisible ? 'text' : 'password'}
+          readOnly={readOnly}
+          className={`w-full bg-white dark:bg-[#0a0f1c] border ${error ? 'border-red-500' : 'border-slate-300 dark:border-slate-700'} rounded-xl pl-4 pr-14 py-3 min-h-[48px] text-base md:text-sm text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 transition-colors ${readOnly ? 'bg-slate-50 dark:bg-[#131b2f] text-slate-500 dark:text-slate-400 cursor-not-allowed' : ''} ${className}`}
+          {...props}
+        />
+        <button
+          type="button"
+          onClick={() => setIsVisible(prev => !prev)}
+          className="absolute right-2 top-1/2 -translate-y-1/2 w-11 h-11 inline-flex items-center justify-center rounded-xl text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+          aria-label={isVisible ? 'Sembunyikan password' : 'Lihat password'}
+        >
+          {isVisible ? <EyeOff size={20} /> : <Eye size={20} />}
+        </button>
+      </div>
+      {error && <p className="text-xs text-red-500 font-medium">{error}</p>}
+    </div>
+  );
+};
 
 const Select = ({ label, options, error, ...props }) => (
   <div className="space-y-2">
@@ -844,7 +887,7 @@ const LoginView = ({ onLoginSuccess, showToast }) => {
             </div>
 
             <Input label="Username" placeholder="Masukkan username..." value={username} onChange={e => setUsername(e.target.value)} required />
-            <Input label="Password" type="password" placeholder="Masukkan password..." value={password} onChange={e => setPassword(e.target.value)} required />
+            <PasswordInput label="Password" placeholder="Masukkan password..." value={password} onChange={e => setPassword(e.target.value)} required />
             
             <Button type="submit" className="w-full py-4 mt-4 text-base shadow-lg">Login Sekarang</Button>
           </form>
@@ -918,7 +961,7 @@ const DashboardLayout = ({ children, currentView, setView, user, onLogout }) => 
           <div className="bg-white dark:bg-[#111828] border border-slate-200 dark:border-slate-800 px-2 py-1.5 rounded-lg">
             <LazisnuLogo variant={theme === 'dark' ? 'white' : 'color'} size="sm" />
           </div>
-          <span className="font-extrabold text-lg text-slate-900 dark:text-white tracking-tight">GARUT</span>
+          <span className="font-extrabold text-base text-slate-900 dark:text-white tracking-tight leading-tight">LAZISNU GARUT</span>
         </div>
         <div className="flex items-center gap-1">
           <button onClick={toggleTheme} className="w-11 h-11 flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition-colors">
@@ -1173,7 +1216,7 @@ const UsersView = ({ showToast }) => {
             <form onSubmit={handleSave} className="space-y-5 pb-6">
               <Input label="Nama Lengkap" placeholder="Contoh: Desandi" value={formData.name} onChange={e => setFormData({ ...formData, name: e.target.value })} required />
               <Input label="Username" placeholder="Contoh: desandi" value={formData.username} onChange={e => setFormData({ ...formData, username: e.target.value })} required />
-              <Input label="Password" type="password" placeholder={formData.id ? 'Kosongkan jika tidak diubah' : 'Masukkan password'} value={formData.password} onChange={e => setFormData({ ...formData, password: e.target.value })} required={!formData.id} />
+              <PasswordInput label="Password" placeholder={formData.id ? 'Kosongkan jika tidak diubah' : 'Masukkan password'} value={formData.password} onChange={e => setFormData({ ...formData, password: e.target.value })} required={!formData.id} />
               <Select label="Role" value={formData.role} onChange={e => setFormData({ ...formData, role: e.target.value })} options={USER_ROLES} required />
               <Select label="Status" value={formData.status} onChange={e => setFormData({ ...formData, status: e.target.value })} options={USER_STATUSES} required />
 
@@ -1204,11 +1247,11 @@ const ProductsView = ({ showToast }) => {
     isActive: product.isActive ?? true
   });
 
-  const [products, setProducts] = useState(() => db.getProducts());
+  const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts()));
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [formData, setFormData] = useState(createProductFormData);
 
-  const loadProducts = () => setProducts(db.getProducts());
+  const loadProducts = () => setProducts(sortProductsByCategory(db.getProducts()));
 
   const handleSave = (e) => {
     e.preventDefault();
@@ -1338,7 +1381,7 @@ const ProductsView = ({ showToast }) => {
 
 const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) => {
   const { user } = useContext(AppContext);
-  const [products] = useState(() => db.getProducts().filter(p => p.isActive && p.stock > 0));
+  const [products] = useState(() => sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [form, setForm] = useState({ buyerName: '', productId: '', qty: 1, paymentMethod: 'Tunai', notes: '' });
   const [cartItems, setCartItems] = useState([]);
@@ -2164,6 +2207,10 @@ export default function App() {
   const [invoiceData, setInvoiceData] = useState(null);
   const [invoiceBackView, setInvoiceBackView] = useState('sales');
   const [theme, setTheme] = useState(getInitialTheme);
+  const viewRef = useRef(view);
+  const userRef = useRef(user);
+  const invoiceBackViewRef = useRef(invoiceBackView);
+  const skipNextHistoryPushRef = useRef(false);
 
   useEffect(() => {
     localStorage.setItem(THEME_STORAGE_KEY, theme);
@@ -2174,6 +2221,51 @@ export default function App() {
 
   const showToast = (message, type = 'success') => setToast({ message, type });
   const closeToast = () => setToast(null);
+
+  useEffect(() => {
+    viewRef.current = view;
+    userRef.current = user;
+    invoiceBackViewRef.current = invoiceBackView;
+  }, [view, user, invoiceBackView]);
+
+  useEffect(() => {
+    if (!user || !INTERNAL_HISTORY_VIEWS.includes(view)) return;
+
+    const state = { lazisnuView: view };
+
+    if (skipNextHistoryPushRef.current) {
+      skipNextHistoryPushRef.current = false;
+      window.history.replaceState(state, '', window.location.href);
+      return;
+    }
+
+    if (window.history.state?.lazisnuView !== view) {
+      window.history.pushState(state, '', window.location.href);
+    }
+  }, [user, view]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const currentUser = userRef.current;
+      const currentView = viewRef.current;
+
+      if (!currentUser || !INTERNAL_HISTORY_VIEWS.includes(currentView)) return;
+
+      skipNextHistoryPushRef.current = true;
+
+      if (currentView === 'invoice') {
+        setView(invoiceBackViewRef.current || 'reports');
+        return;
+      }
+
+      if (currentView !== 'dashboard') {
+        setView('dashboard');
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     if (!user) return;
@@ -2199,16 +2291,30 @@ export default function App() {
   useEffect(() => {
     if (!user) return undefined;
 
-    const handleStorageChange = (event) => {
-      if ((event.key === SESSION_STORAGE_KEY && !event.newValue) || !validateStoredUser(user)) {
+    const validateActiveSession = () => {
+      if (!localStorage.getItem(SESSION_STORAGE_KEY) || !validateStoredUser(user)) {
         clearStoredSession();
         setUser(null);
         setView('welcome');
       }
     };
 
+    const handleStorageChange = (event) => {
+      if ([SESSION_STORAGE_KEY, 'lazisnu_core_users'].includes(event.key)) validateActiveSession();
+    };
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) validateActiveSession();
+    };
+
     window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
+    window.addEventListener('focus', validateActiveSession);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('focus', validateActiveSession);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [user]);
 
   const handleLoginSuccess = (userData) => {
