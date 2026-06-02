@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, createContext, useContext } from 'react';
 import logoWhite from './assets/LOGO LAZISNU PUTIH.png';
 import logoColor from './assets/LOGO LAZISNU WARNA.png';
+import { checkDatabaseConnection } from './services/database/dbHealthService';
+import { migrateLocalDataToSupabase } from './services/database/dbMigrationService';
 import { 
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
@@ -930,7 +932,7 @@ const LoginView = ({ onLoginSuccess, showToast }) => {
 
             <Input label="Username" placeholder="Masukkan username..." value={username} onChange={e => setUsername(e.target.value)} required />
             <PasswordInput label="Password" placeholder="Masukkan password..." value={password} onChange={e => setPassword(e.target.value)} required />
-            
+
             <Button type="submit" className="w-full py-4 mt-4 text-base shadow-lg">Login Sekarang</Button>
           </form>
         </Card>
@@ -2122,11 +2124,18 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
 };
 
 const SpreadsheetView = ({ showToast }) => {
+  const { user } = useContext(AppContext);
   const [pendingCount, setPendingCount] = useState(() => db.getPendingSyncs().length);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isCheckingDatabase, setIsCheckingDatabase] = useState(false);
+  const [isMigratingDatabase, setIsMigratingDatabase] = useState(false);
   const [lastSync, setLastSync] = useState(localStorage.getItem('lazisnu_last_sync_core') || null);
   const [webAppUrl, setWebAppUrl] = useState(() => db.getSpreadsheetUrl());
   const [lastStatus, setLastStatus] = useState('Siap sinkronisasi.');
+  const [databaseStatus, setDatabaseStatus] = useState({
+    status: 'unknown',
+    message: 'Belum dicek.'
+  });
 
   const checkPending = () => setPendingCount(db.getPendingSyncs().length);
 
@@ -2153,6 +2162,38 @@ const SpreadsheetView = ({ showToast }) => {
       showToast('Backup data berhasil diexport.', 'success');
     } catch {
       showToast('Gagal export backup data. Coba ulangi beberapa saat lagi.', 'error');
+    }
+  };
+
+  const handleCheckDatabase = async () => {
+    if (isCheckingDatabase) return;
+
+    setIsCheckingDatabase(true);
+    try {
+      const result = await checkDatabaseConnection();
+      setDatabaseStatus(result);
+      showToast(result.message, result.status === 'connected' ? 'success' : 'error');
+    } finally {
+      setIsCheckingDatabase(false);
+    }
+  };
+
+  const handleMigrateLocalData = async () => {
+    if (isMigratingDatabase) return;
+
+    const isConfirmed = window.confirm('Data lokal akan dikirim ke Supabase. Data lokal tidak akan dihapus.');
+    if (!isConfirmed) return;
+
+    setIsMigratingDatabase(true);
+    try {
+      await migrateLocalDataToSupabase(db.exportBackupData());
+      setDatabaseStatus({ status: 'connected', message: 'Database terhubung. Migrasi terakhir berhasil.' });
+      showToast('Data lokal berhasil dimigrasikan ke database.', 'success');
+    } catch (err) {
+      setDatabaseStatus({ status: 'error', message: err.message || 'Migrasi gagal.' });
+      showToast('Migrasi gagal. Data lokal tetap aman.', 'error');
+    } finally {
+      setIsMigratingDatabase(false);
     }
   };
 
@@ -2216,6 +2257,35 @@ const SpreadsheetView = ({ showToast }) => {
           <Button type="button" variant="secondary" onClick={handleExportBackup} className="w-full sm:w-auto shrink-0">
             <Download size={18} /> Export Backup Data
           </Button>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0a0f1c] p-4 md:p-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+            <div>
+              <h2 className="text-sm md:text-base font-extrabold text-slate-900 dark:text-white">Status Database</h2>
+              <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
+                {databaseStatus.status === 'connected'
+                  ? 'Terhubung'
+                  : databaseStatus.status === 'not_configured'
+                    ? 'Belum dikonfigurasi'
+                    : databaseStatus.status === 'error'
+                      ? 'Gagal terhubung'
+                      : 'Belum dicek'}
+                {' - '}{databaseStatus.message}
+              </p>
+            </div>
+            <Button type="button" variant="secondary" onClick={handleCheckDatabase} isLoading={isCheckingDatabase} className="w-full sm:w-auto shrink-0">
+              Cek Koneksi Database
+            </Button>
+          </div>
+          {user?.role === 'owner' && (
+            <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">Phase 1: kirim data lokal ke Supabase tanpa menghapus data browser.</p>
+              <Button type="button" onClick={handleMigrateLocalData} isLoading={isMigratingDatabase} className="w-full sm:w-auto shrink-0">
+                Migrasi Data Lokal ke Database
+              </Button>
+            </div>
+          )}
         </div>
 
         <div className="pt-6 md:pt-8 border-t border-slate-100 dark:border-slate-800/80 flex flex-col items-center gap-3">
@@ -2435,7 +2505,6 @@ export default function App() {
             {view === 'welcome' && <WelcomeView onNext={() => setView('login')} />}
             {view === 'login' && <LoginView onLoginSuccess={handleLoginSuccess} showToast={showToast} />}
             {view === 'modules' && <ModuleSelectionView onSelectModule={setView} showToast={showToast} />}
-            
             {['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'].includes(view) && user && (
               <DashboardLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
                 {view === 'dashboard' && <DashboardOverview />}

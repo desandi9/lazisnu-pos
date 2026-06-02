@@ -82,6 +82,34 @@ Apps Script membuat dan memakai 5 tab di spreadsheet yang sama:
 - `Rekap Laba`
 - `Rekap Petugas`
 
+## Supabase Database Phase 1
+
+Phase 1 menambahkan foundation Supabase PostgreSQL dan migrasi data lokal, tetapi belum mengganti seluruh flow localStorage. Aplikasi tetap berjalan tanpa Supabase dan tidak crash jika `.env` belum diisi.
+
+Langkah setup:
+
+1. Buat project baru di Supabase.
+2. Buka `SQL Editor`.
+3. Jalankan file `supabase/schema.sql`.
+4. Buka `Project Settings` -> `API`.
+5. Copy `Project URL` dan `anon public key`.
+6. Copy `.env.example` menjadi `.env`.
+7. Isi:
+   - `VITE_SUPABASE_URL`
+   - `VITE_SUPABASE_ANON_KEY`
+8. Jalankan `npm run dev`.
+9. Buka halaman `Spreadsheet`.
+10. Klik `Cek Koneksi Database`.
+11. Login sebagai Owner, lalu klik `Migrasi Data Lokal ke Database`.
+
+Catatan keamanan Phase 1:
+
+- Jangan pernah menaruh service role key di frontend.
+- Password pada tabel `users` masih mengikuti MVP lokal untuk kompatibilitas migrasi awal.
+- Phase 2 wajib pindah ke Supabase Auth atau hashed password proper, plus RLS policy per role.
+- Phase 1 hanya foundation dan migrasi. Read/write utama aplikasi masih localStorage.
+- Phase 2 akan mengubah aplikasi agar read/write langsung ke Supabase.
+
 ## Deploy ke Vercel
 
 Opsi paling sederhana:
