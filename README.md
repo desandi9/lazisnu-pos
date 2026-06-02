@@ -110,6 +110,17 @@ Catatan keamanan Phase 1:
 - Phase 1 hanya foundation dan migrasi. Read/write utama aplikasi masih localStorage.
 - Phase 2 akan mengubah aplikasi agar read/write langsung ke Supabase.
 
+## Supabase Migration Phase 2A
+
+Phase 2A mulai memakai tabel `public.users` sebagai sumber utama untuk login dan menu `Data Pengguna`.
+
+- Login Owner/Admin membaca user dari Supabase jika `.env` sudah dikonfigurasi.
+- Menu `Data Pengguna` mengambil, menambah, mengedit, dan mengaktifkan/nonaktifkan user ke Supabase.
+- localStorage tetap dipakai sebagai cache dan fallback jika Supabase belum dikonfigurasi atau koneksi database gagal.
+- Session restore mengecek status user aktif dari Supabase jika tersedia, lalu fallback ke cache lokal jika database tidak tersedia.
+- Produk, transaksi, laporan, spreadsheet sync, struk, dan export laporan belum dipindah ke Supabase di Phase 2A.
+- Supabase Auth belum dipakai di Phase 2A. Password masih mengikuti tabel `users` MVP untuk transisi bertahap.
+
 ## Deploy ke Vercel
 
 Opsi paling sederhana:

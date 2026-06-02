@@ -3,6 +3,13 @@ import logoWhite from './assets/LOGO LAZISNU PUTIH.png';
 import logoColor from './assets/LOGO LAZISNU WARNA.png';
 import { checkDatabaseConnection } from './services/database/dbHealthService';
 import { migrateLocalDataToSupabase } from './services/database/dbMigrationService';
+import {
+  createUserInDb,
+  getUserByUsernameFromDb,
+  setUserStatusInDb,
+  syncUsersCacheFromDb,
+  updateUserInDb
+} from './services/database/dbUserService';
 import { 
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
@@ -611,6 +618,48 @@ const getInitialSessionState = () => {
   }
 };
 
+const validateStoredUserWithDbFallback = async (storedUser) => {
+  const dbResult = await getUserByUsernameFromDb(storedUser?.username);
+
+  if (dbResult.success) {
+    const dbUser = dbResult.data;
+
+    if (dbUser && dbUser.id === storedUser.id && dbUser.role === storedUser.role && dbUser.status === 'active') {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toCurrentUser(dbUser)));
+      return toCurrentUser(dbUser);
+    }
+
+    return null;
+  }
+
+  return validateStoredUser(storedUser);
+};
+
+const loginWithDbFallback = async (username, password, role) => {
+  const normalizedUsername = username.trim().toLowerCase();
+  const dbResult = await getUserByUsernameFromDb(normalizedUsername);
+
+  if (dbResult.success) {
+    const user = dbResult.data;
+
+    if (!user || user.password !== password || user.role !== role) {
+      throw new Error('Username, password, atau role salah.');
+    }
+
+    if (user.status !== 'active') {
+      throw new Error('User nonaktif tidak bisa login.');
+    }
+
+    const cacheResult = await syncUsersCacheFromDb();
+    if (!cacheResult.success) localStorage.setItem('lazisnu_core_users', JSON.stringify([user]));
+
+    return { user: toCurrentUser(user), source: 'database' };
+  }
+
+  const localUser = db.login(normalizedUsername, password, role);
+  return { user: localUser, source: 'local' };
+};
+
 // ============================================================================
 // 2. CONTEXT & STATE MANAGEMENT
 // ============================================================================
@@ -901,14 +950,21 @@ const LoginView = ({ onLoginSuccess, showToast }) => {
   const [role, setRole] = useState('admin');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
+    if (isSubmitting) return;
+
+    setIsSubmitting(true);
     try {
-      const user = db.login(username, password, role);
-      onLoginSuccess(user);
+      const result = await loginWithDbFallback(username, password, role);
+      if (result.source === 'local') showToast('Database tidak tersedia, menggunakan data lokal.', 'error');
+      onLoginSuccess(result.user);
     } catch (err) {
       showToast(err.message, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -933,7 +989,7 @@ const LoginView = ({ onLoginSuccess, showToast }) => {
             <Input label="Username" placeholder="Masukkan username..." value={username} onChange={e => setUsername(e.target.value)} required />
             <PasswordInput label="Password" placeholder="Masukkan password..." value={password} onChange={e => setPassword(e.target.value)} required />
 
-            <Button type="submit" className="w-full py-4 mt-4 text-base shadow-lg">Login Sekarang</Button>
+            <Button type="submit" isLoading={isSubmitting} className="w-full py-4 mt-4 text-base shadow-lg">Login Sekarang</Button>
           </form>
         </Card>
         <p className="text-center mt-6 text-xs font-medium text-slate-500 dark:text-slate-500 opacity-80">LAZISNU Garut v1.0</p>
@@ -1163,36 +1219,122 @@ const UsersView = ({ showToast }) => {
 
   const [users, setUsers] = useState(() => db.getUsers());
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmittingUser, setIsSubmittingUser] = useState(false);
+  const [userSource, setUserSource] = useState('Lokal');
   const [formData, setFormData] = useState(createUserFormData);
 
   const loadUsers = () => setUsers(db.getUsers());
 
-  const handleSave = (e) => {
+  const refreshUsers = async () => {
+    const result = await syncUsersCacheFromDb();
+
+    if (result.success) {
+      setUsers(result.data);
+      setUserSource('Database');
+      return result.data;
+    }
+
+    const localUsers = db.getUsers();
+    setUsers(localUsers);
+    setUserSource('Lokal');
+    if (result.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal.', 'error');
+
+    return localUsers;
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await syncUsersCacheFromDb();
+
+      if (!isMounted) return;
+
+      if (result.success) {
+        setUsers(result.data);
+        setUserSource('Database');
+        return;
+      }
+
+      setUsers(db.getUsers());
+      setUserSource('Lokal');
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleSave = async (e) => {
     e.preventDefault();
+    if (isSubmittingUser) return;
 
     if (!formData.name.trim()) return showToast('Nama lengkap wajib diisi', 'error');
     if (!formData.username.trim()) return showToast('Username wajib diisi', 'error');
     if (!formData.id && !formData.password) return showToast('Password wajib untuk user baru', 'error');
 
+    setIsSubmittingUser(true);
     try {
-      db.saveUser(formData);
-      showToast('Data pengguna tersimpan');
+      const username = formData.username.trim().toLowerCase();
+      const nextUsers = formData.id
+        ? users.map(item => item.id === formData.id ? { ...item, ...formData, username, password: formData.password || item.password, updatedAt: new Date().toISOString() } : item)
+        : [...users, { ...formData, id: `U-${Date.now()}`, username, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }];
+
+      db.ensureActiveOwner(nextUsers);
+
+      const result = formData.id
+        ? await updateUserInDb(formData.id, {
+            name: formData.name.trim(),
+            username,
+            password: formData.password,
+            role: formData.role,
+            status: formData.status
+          })
+        : await createUserInDb({
+            name: formData.name.trim(),
+            username,
+            password: formData.password,
+            role: formData.role,
+            status: formData.status
+          });
+
+      if (result.success) {
+        await refreshUsers();
+        showToast('Data pengguna berhasil diperbarui.');
+      } else {
+        db.saveUser(formData);
+        loadUsers();
+        setUserSource('Lokal');
+        showToast(result.status === 'not_configured' ? 'Data pengguna berhasil diperbarui.' : 'Database tidak tersedia, menggunakan data lokal.', result.status === 'not_configured' ? 'success' : 'error');
+      }
       setIsModalOpen(false);
-      loadUsers();
     } catch (err) {
-      showToast(err.message, 'error');
+      showToast(err.message || 'Gagal memperbarui data pengguna.', 'error');
+    } finally {
+      setIsSubmittingUser(false);
     }
   };
 
-  const handleStatusChange = (selectedUser) => {
+  const handleStatusChange = async (selectedUser) => {
     const nextStatus = selectedUser.status === 'active' ? 'inactive' : 'active';
 
     try {
-      db.setUserStatus(selectedUser.id, nextStatus);
-      showToast(nextStatus === 'active' ? 'Pengguna diaktifkan kembali' : 'Pengguna dinonaktifkan');
-      loadUsers();
+      const nextUsers = users.map(user => user.id === selectedUser.id ? { ...user, status: nextStatus } : user);
+      db.ensureActiveOwner(nextUsers);
+
+      const result = await setUserStatusInDb(selectedUser.id, nextStatus);
+
+      if (result.success) {
+        await refreshUsers();
+        showToast('Data pengguna berhasil diperbarui.');
+      } else {
+        db.setUserStatus(selectedUser.id, nextStatus);
+        loadUsers();
+        setUserSource('Lokal');
+        showToast(result.status === 'not_configured' ? (nextStatus === 'active' ? 'Pengguna diaktifkan kembali' : 'Pengguna dinonaktifkan') : 'Database tidak tersedia, menggunakan data lokal.', result.status === 'not_configured' ? 'success' : 'error');
+      }
     } catch (err) {
-      showToast(err.message, 'error');
+      showToast(err.message || 'Gagal memperbarui data pengguna.', 'error');
     }
   };
 
@@ -1202,6 +1344,7 @@ const UsersView = ({ showToast }) => {
         <div>
           <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Data Pengguna</h1>
           <p className="text-sm text-slate-500 mt-1.5">Kelola owner dan petugas yang dapat login ke sistem.</p>
+          <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber pengguna: {userSource}</p>
         </div>
         <Button onClick={() => { setFormData(createUserFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto shadow-lg"><Plus size={20} /> Tambah Pengguna</Button>
       </header>
@@ -1266,7 +1409,7 @@ const UsersView = ({ showToast }) => {
 
               <div className="flex gap-3 pt-4">
                 <Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button>
-                <Button type="submit" className="flex-1 shadow-lg shadow-emerald-600/20">Simpan</Button>
+                <Button type="submit" isLoading={isSubmittingUser} className="flex-1 shadow-lg shadow-emerald-600/20">Simpan</Button>
               </div>
             </form>
           </Card>
@@ -2388,29 +2531,41 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
 
-    const validUser = validateStoredUser(user);
+    let isCancelled = false;
 
-    if (!validUser) {
-      clearStoredSession();
-      queueMicrotask(() => {
+    const validateSession = async () => {
+      const validUser = await validateStoredUserWithDbFallback(user);
+
+      if (isCancelled) return;
+
+      if (!validUser) {
+        clearStoredSession();
         setUser(null);
         setView('welcome');
-      });
-      return;
-    }
+        return;
+      }
 
-    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(validUser));
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(validUser));
 
-    if (isRestorableView(view, validUser)) {
-      localStorage.setItem(LAST_VIEW_STORAGE_KEY, view);
-    }
+      if (isRestorableView(view, validUser)) {
+        localStorage.setItem(LAST_VIEW_STORAGE_KEY, view);
+      }
+    };
+
+    validateSession();
+
+    return () => {
+      isCancelled = true;
+    };
   }, [user, view]);
 
   useEffect(() => {
     if (!user) return undefined;
 
-    const validateActiveSession = () => {
-      if (!localStorage.getItem(SESSION_STORAGE_KEY) || !validateStoredUser(user) || hasBackgroundSessionTimedOut()) {
+    const validateActiveSession = async () => {
+      const validUser = await validateStoredUserWithDbFallback(user);
+
+      if (!localStorage.getItem(SESSION_STORAGE_KEY) || !validUser || hasBackgroundSessionTimedOut()) {
         clearStoredSession();
         setUser(null);
         setView('welcome');

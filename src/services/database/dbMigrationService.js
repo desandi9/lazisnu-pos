@@ -18,7 +18,8 @@ export async function migrateLocalDataToSupabase(localData) {
   };
 
   const users = await upsertUsersToDb(localData.users || []);
-  summary.users = users.length;
+  if (!users.success) throw new Error(users.error || 'Migrasi pengguna gagal.');
+  summary.users = users.data.length;
 
   const products = await upsertProductsToDb(localData.products || []);
   summary.products = products.length;
