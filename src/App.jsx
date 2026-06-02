@@ -619,12 +619,15 @@ const getInitialSessionState = () => {
 };
 
 const validateStoredUserWithDbFallback = async (storedUser) => {
-  const dbResult = await getUserByUsernameFromDb(storedUser?.username);
+  const health = await checkDatabaseConnection();
 
-  if (dbResult.success) {
+  if (health.status === 'connected') {
+    const dbResult = await getUserByUsernameFromDb(storedUser?.username);
+    if (!dbResult.success) return null;
+
     const dbUser = dbResult.data;
 
-    if (dbUser && dbUser.id === storedUser.id && dbUser.role === storedUser.role && dbUser.status === 'active') {
+    if (dbUser && (dbUser.id === storedUser.id || dbUser.username === storedUser.username) && dbUser.role === storedUser.role && dbUser.status === 'active') {
       localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toCurrentUser(dbUser)));
       return toCurrentUser(dbUser);
     }
@@ -637,21 +640,19 @@ const validateStoredUserWithDbFallback = async (storedUser) => {
 
 const loginWithDbFallback = async (username, password, role) => {
   const normalizedUsername = username.trim().toLowerCase();
-  const dbResult = await getUserByUsernameFromDb(normalizedUsername);
+  const health = await checkDatabaseConnection();
 
-  if (dbResult.success) {
+  if (health.status === 'connected') {
+    const dbResult = await getUserByUsernameFromDb(normalizedUsername);
+    if (!dbResult.success) throw new Error('Gagal membaca user dari database.');
+
     const user = dbResult.data;
 
-    if (!user || user.password !== password || user.role !== role) {
-      throw new Error('Username, password, atau role salah.');
-    }
+    if (!user || user.role !== role) throw new Error('User tidak ditemukan di database.');
+    if (user.password !== password) throw new Error('Password salah.');
+    if (user.status !== 'active') throw new Error('Akun tidak aktif.');
 
-    if (user.status !== 'active') {
-      throw new Error('User nonaktif tidak bisa login.');
-    }
-
-    const cacheResult = await syncUsersCacheFromDb();
-    if (!cacheResult.success) localStorage.setItem('lazisnu_core_users', JSON.stringify([user]));
+    await syncUsersCacheFromDb();
 
     return { user: toCurrentUser(user), source: 'database' };
   }
@@ -1226,12 +1227,20 @@ const UsersView = ({ showToast }) => {
   const loadUsers = () => setUsers(db.getUsers());
 
   const refreshUsers = async () => {
+    const health = await checkDatabaseConnection();
     const result = await syncUsersCacheFromDb();
 
     if (result.success) {
       setUsers(result.data);
       setUserSource('Database');
       return result.data;
+    }
+
+    if (health.status === 'connected') {
+      setUsers([]);
+      setUserSource('Database');
+      showToast('Gagal memuat data pengguna dari database.', 'error');
+      return [];
     }
 
     const localUsers = db.getUsers();
@@ -1246,12 +1255,19 @@ const UsersView = ({ showToast }) => {
     let isMounted = true;
 
     queueMicrotask(async () => {
+      const health = await checkDatabaseConnection();
       const result = await syncUsersCacheFromDb();
 
       if (!isMounted) return;
 
       if (result.success) {
         setUsers(result.data);
+        setUserSource('Database');
+        return;
+      }
+
+      if (health.status === 'connected') {
+        setUsers([]);
         setUserSource('Database');
         return;
       }
@@ -1276,36 +1292,39 @@ const UsersView = ({ showToast }) => {
     setIsSubmittingUser(true);
     try {
       const username = formData.username.trim().toLowerCase();
+      const health = await checkDatabaseConnection();
       const nextUsers = formData.id
         ? users.map(item => item.id === formData.id ? { ...item, ...formData, username, password: formData.password || item.password, updatedAt: new Date().toISOString() } : item)
         : [...users, { ...formData, id: `U-${Date.now()}`, username, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }];
 
       db.ensureActiveOwner(nextUsers);
 
-      const result = formData.id
-        ? await updateUserInDb(formData.id, {
-            name: formData.name.trim(),
-            username,
-            password: formData.password,
-            role: formData.role,
-            status: formData.status
-          })
-        : await createUserInDb({
-            name: formData.name.trim(),
-            username,
-            password: formData.password,
-            role: formData.role,
-            status: formData.status
-          });
+      if (health.status === 'connected') {
+        const result = formData.id
+          ? await updateUserInDb(formData.id, {
+              name: formData.name.trim(),
+              username,
+              password: formData.password,
+              role: formData.role,
+              status: formData.status
+            })
+          : await createUserInDb({
+              name: formData.name.trim(),
+              username,
+              password: formData.password,
+              role: formData.role,
+              status: formData.status
+            });
 
-      if (result.success) {
+        if (!result.success) throw new Error('Gagal menyimpan pengguna ke database.');
+
         await refreshUsers();
         showToast('Data pengguna berhasil diperbarui.');
       } else {
         db.saveUser(formData);
         loadUsers();
         setUserSource('Lokal');
-        showToast(result.status === 'not_configured' ? 'Data pengguna berhasil diperbarui.' : 'Database tidak tersedia, menggunakan data lokal.', result.status === 'not_configured' ? 'success' : 'error');
+        showToast(health.status === 'not_configured' ? 'Data pengguna berhasil diperbarui.' : 'Database tidak tersedia, menggunakan data lokal.', health.status === 'not_configured' ? 'success' : 'error');
       }
       setIsModalOpen(false);
     } catch (err) {
@@ -1320,18 +1339,20 @@ const UsersView = ({ showToast }) => {
 
     try {
       const nextUsers = users.map(user => user.id === selectedUser.id ? { ...user, status: nextStatus } : user);
+      const health = await checkDatabaseConnection();
       db.ensureActiveOwner(nextUsers);
 
-      const result = await setUserStatusInDb(selectedUser.id, nextStatus);
+      if (health.status === 'connected') {
+        const result = await setUserStatusInDb(selectedUser.id, nextStatus);
+        if (!result.success) throw new Error('Gagal menyimpan pengguna ke database.');
 
-      if (result.success) {
         await refreshUsers();
         showToast('Data pengguna berhasil diperbarui.');
       } else {
         db.setUserStatus(selectedUser.id, nextStatus);
         loadUsers();
         setUserSource('Lokal');
-        showToast(result.status === 'not_configured' ? (nextStatus === 'active' ? 'Pengguna diaktifkan kembali' : 'Pengguna dinonaktifkan') : 'Database tidak tersedia, menggunakan data lokal.', result.status === 'not_configured' ? 'success' : 'error');
+        showToast(health.status === 'not_configured' ? (nextStatus === 'active' ? 'Pengguna diaktifkan kembali' : 'Pengguna dinonaktifkan') : 'Database tidak tersedia, menggunakan data lokal.', health.status === 'not_configured' ? 'success' : 'error');
       }
     } catch (err) {
       showToast(err.message || 'Gagal memperbarui data pengguna.', 'error');
