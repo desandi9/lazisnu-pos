@@ -5,9 +5,11 @@ import { checkDatabaseConnection } from './services/database/dbHealthService';
 import { migrateLocalDataToSupabase } from './services/database/dbMigrationService';
 import {
   createUserInDb,
+  deleteUserFromDb,
   getUserByUsernameFromDb,
   setUserStatusInDb,
   syncUsersCacheFromDb,
+  checkUserHasTransactions,
   updateUserInDb
 } from './services/database/dbUserService';
 import { 
@@ -282,6 +284,13 @@ class DatabaseService {
     this._set('users', users);
   }
 
+  deleteUser(id) {
+    const users = this.getUsers().filter(user => user.id !== id);
+
+    this.ensureActiveOwner(users);
+    this._set('users', users);
+  }
+
   login(username, password, role) {
     const users = this.getUsers();
     const user = users.find(u => u.username === username.trim().toLowerCase() && u.password === password && u.role === role);
@@ -531,11 +540,11 @@ class DatabaseService {
 
 const db = new DatabaseService();
 const THEME_STORAGE_KEY = 'lazisnu_theme_core';
-const SESSION_STORAGE_KEY = 'lazisnu_current_user';
-const LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view';
+const SESSION_STORAGE_KEY = 'lazisnu_current_user_session';
+const LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view_session';
+const LEGACY_SESSION_STORAGE_KEY = 'lazisnu_current_user';
+const LEGACY_LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view';
 const LAST_BACKGROUND_STORAGE_KEY = 'lazisnu_last_background_at';
-// 30 detik untuk testing. Naikkan ke 10-15 menit untuk production jika dibutuhkan.
-const SESSION_BACKGROUND_TIMEOUT_MS = 30000;
 const RESTORABLE_VIEWS = ['dashboard', 'sales', 'products', 'reports', 'users', 'profit-settings', 'spreadsheet'];
 const INTERNAL_HISTORY_VIEWS = ['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'];
 
@@ -554,24 +563,31 @@ const getInitialTheme = () => {
 };
 
 const clearStoredSession = () => {
-  localStorage.removeItem(SESSION_STORAGE_KEY);
-  localStorage.removeItem(LAST_VIEW_STORAGE_KEY);
-};
-
-const clearBackgroundTimestamp = () => {
+  sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  sessionStorage.removeItem(LAST_VIEW_STORAGE_KEY);
+  localStorage.removeItem(LEGACY_SESSION_STORAGE_KEY);
+  localStorage.removeItem(LEGACY_LAST_VIEW_STORAGE_KEY);
   localStorage.removeItem(LAST_BACKGROUND_STORAGE_KEY);
 };
 
-const markAppBackgrounded = () => {
-  if (localStorage.getItem(SESSION_STORAGE_KEY)) {
-    localStorage.setItem(LAST_BACKGROUND_STORAGE_KEY, Date.now().toString());
-  }
+const storeSessionUser = (user) => {
+  sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toCurrentUser(user)));
 };
 
-const hasBackgroundSessionTimedOut = () => {
-  const lastBackgroundAt = Number(localStorage.getItem(LAST_BACKGROUND_STORAGE_KEY) || 0);
+const migrateLegacySession = () => {
+  if (!sessionStorage.getItem(SESSION_STORAGE_KEY)) {
+    const legacyUser = localStorage.getItem(LEGACY_SESSION_STORAGE_KEY);
+    if (legacyUser) sessionStorage.setItem(SESSION_STORAGE_KEY, legacyUser);
+  }
 
-  return lastBackgroundAt > 0 && Date.now() - lastBackgroundAt > SESSION_BACKGROUND_TIMEOUT_MS;
+  if (!sessionStorage.getItem(LAST_VIEW_STORAGE_KEY)) {
+    const legacyView = localStorage.getItem(LEGACY_LAST_VIEW_STORAGE_KEY);
+    if (legacyView) sessionStorage.setItem(LAST_VIEW_STORAGE_KEY, legacyView);
+  }
+
+  localStorage.removeItem(LEGACY_SESSION_STORAGE_KEY);
+  localStorage.removeItem(LEGACY_LAST_VIEW_STORAGE_KEY);
+  localStorage.removeItem(LAST_BACKGROUND_STORAGE_KEY);
 };
 
 const isRestorableView = (view, user) => {
@@ -582,7 +598,7 @@ const isRestorableView = (view, user) => {
 };
 
 const getSafeRestoredView = (user) => {
-  const storedView = localStorage.getItem(LAST_VIEW_STORAGE_KEY);
+  const storedView = sessionStorage.getItem(LAST_VIEW_STORAGE_KEY);
 
   return isRestorableView(storedView, user) ? storedView : 'dashboard';
 };
@@ -602,16 +618,18 @@ const validateStoredUser = (storedUser) => {
 
 const getInitialSessionState = () => {
   try {
-    const storedUser = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || 'null');
-    const validUser = validateStoredUser(storedUser);
+    migrateLegacySession();
 
-    if (!validUser || hasBackgroundSessionTimedOut()) {
+    const storedUser = JSON.parse(sessionStorage.getItem(SESSION_STORAGE_KEY) || 'null');
+
+    if (!storedUser?.id || !storedUser?.username || !storedUser?.role) {
       clearStoredSession();
       return { user: null, view: 'welcome' };
     }
 
-    clearBackgroundTimestamp();
-    return { user: validUser, view: getSafeRestoredView(validUser) };
+    const safeUser = toCurrentUser(storedUser);
+    storeSessionUser(safeUser);
+    return { user: safeUser, view: getSafeRestoredView(safeUser) };
   } catch {
     clearStoredSession();
     return { user: null, view: 'welcome' };
@@ -628,7 +646,7 @@ const validateStoredUserWithDbFallback = async (storedUser) => {
     const dbUser = dbResult.data;
 
     if (dbUser && (dbUser.id === storedUser.id || dbUser.username === storedUser.username) && dbUser.role === storedUser.role && dbUser.status === 'active') {
-      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toCurrentUser(dbUser)));
+      storeSessionUser(dbUser);
       return toCurrentUser(dbUser);
     }
 
@@ -1209,6 +1227,7 @@ const DashboardOverview = () => {
 };
 
 const UsersView = ({ showToast }) => {
+  const { user: currentUser } = useContext(AppContext);
   const createUserFormData = (selectedUser = {}) => ({
     id: selectedUser.id || null,
     name: selectedUser.name || '',
@@ -1221,6 +1240,8 @@ const UsersView = ({ showToast }) => {
   const [users, setUsers] = useState(() => db.getUsers());
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSubmittingUser, setIsSubmittingUser] = useState(false);
+  const [isDeletingUser, setIsDeletingUser] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
   const [userSource, setUserSource] = useState('Lokal');
   const [formData, setFormData] = useState(createUserFormData);
 
@@ -1359,6 +1380,59 @@ const UsersView = ({ showToast }) => {
     }
   };
 
+  const userHasLocalTransactions = (selectedUser) => db.getTransactions().some(tx => (
+    tx.petugasId === selectedUser.id
+    || tx.petugasId === selectedUser.localId
+    || tx.namaPetugasSnapshot === selectedUser.name
+  ));
+
+  const ensureUserCanBeDeleted = async (selectedUser, health) => {
+    if (currentUser?.id === selectedUser.id || currentUser?.username === selectedUser.username) {
+      throw new Error('Pengguna yang sedang login tidak bisa dihapus.');
+    }
+
+    const remainingUsers = users.filter(user => user.id !== selectedUser.id);
+    db.ensureActiveOwner(remainingUsers);
+
+    if (userHasLocalTransactions(selectedUser)) {
+      throw new Error('Pengguna ini sudah memiliki transaksi. Nonaktifkan saja agar riwayat laporan tetap aman.');
+    }
+
+    if (health.status === 'connected') {
+      const txResult = await checkUserHasTransactions(selectedUser);
+      if (!txResult.success) throw new Error(txResult.error || 'Gagal mengecek transaksi pengguna.');
+      if (txResult.data) throw new Error('Pengguna ini sudah memiliki transaksi. Nonaktifkan saja agar riwayat laporan tetap aman.');
+    }
+  };
+
+  const handleDeleteUser = async () => {
+    if (!deleteTarget || isDeletingUser) return;
+
+    setIsDeletingUser(true);
+    try {
+      const health = await checkDatabaseConnection();
+      await ensureUserCanBeDeleted(deleteTarget, health);
+
+      if (health.status === 'connected') {
+        const result = await deleteUserFromDb(deleteTarget.id);
+        if (!result.success) throw new Error('Gagal menghapus pengguna dari database.');
+
+        await refreshUsers();
+      } else {
+        db.deleteUser(deleteTarget.id);
+        loadUsers();
+        setUserSource('Lokal');
+      }
+
+      showToast('Pengguna berhasil dihapus.');
+      setDeleteTarget(null);
+    } catch (err) {
+      showToast(err.message || 'Gagal menghapus pengguna.', 'error');
+    } finally {
+      setIsDeletingUser(false);
+    }
+  };
+
   return (
     <div className="space-y-6 md:space-y-8 animate-fade-in">
       <header className="flex flex-col sm:flex-row justify-between sm:items-end gap-4 px-1 md:px-0">
@@ -1398,11 +1472,12 @@ const UsersView = ({ showToast }) => {
                     </span>
                   </td>
                   <td className="p-4 text-right">
-                    <div className="flex justify-end gap-2">
+                    <div className="flex flex-wrap justify-end gap-2">
                       <button onClick={() => { setFormData(createUserFormData(item)); setIsModalOpen(true); }} className="px-3 py-2 min-h-[40px] text-xs font-bold text-slate-600 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95">Edit</button>
                       <button onClick={() => handleStatusChange(item)} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 ${item.status === 'active' ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>
                         {item.status === 'active' ? 'Nonaktifkan' : 'Aktifkan'}
                       </button>
+                      <button onClick={() => setDeleteTarget(item)} className="px-3 py-2 min-h-[40px] text-xs font-bold text-red-600 border border-red-200 bg-red-50 hover:bg-red-100 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400 dark:hover:bg-red-500/20 rounded-xl shadow-sm transition-colors active:scale-95">Hapus</button>
                     </div>
                   </td>
                 </tr>
@@ -1433,6 +1508,30 @@ const UsersView = ({ showToast }) => {
                 <Button type="submit" isLoading={isSubmittingUser} className="flex-1 shadow-lg shadow-emerald-600/20">Simpan</Button>
               </div>
             </form>
+          </Card>
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">
+          <Card className="w-full max-w-md shadow-2xl rounded-b-none md:rounded-2xl animate-fade-in-up">
+            <div className="flex justify-between items-start gap-4 mb-5">
+              <div>
+                <h2 className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">Hapus Pengguna?</h2>
+                <p className="text-sm text-slate-500 dark:text-slate-400 mt-2">Yakin ingin menghapus pengguna ini?</p>
+              </div>
+              <button onClick={() => setDeleteTarget(null)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full"><X size={22} /></button>
+            </div>
+
+            <div className="rounded-2xl border border-red-100 dark:border-red-500/20 bg-red-50 dark:bg-red-500/10 p-4 mb-6">
+              <p className="font-extrabold text-red-700 dark:text-red-300">{deleteTarget.name}</p>
+              <p className="text-sm text-red-600/80 dark:text-red-300/80 mt-1">Pengguna yang sudah memiliki transaksi sebaiknya dinonaktifkan agar riwayat laporan tetap aman.</p>
+            </div>
+
+            <div className="flex gap-3">
+              <Button type="button" variant="secondary" className="flex-1" onClick={() => setDeleteTarget(null)}>Batal</Button>
+              <Button type="button" variant="danger" isLoading={isDeletingUser} className="flex-1" onClick={handleDeleteUser}>Hapus</Button>
+            </div>
           </Card>
         </div>
       )}
@@ -2484,6 +2583,7 @@ export default function App() {
   const [invoiceBackView, setInvoiceBackView] = useState('sales');
   const [theme, setTheme] = useState(getInitialTheme);
   const [isBooting, setIsBooting] = useState(true);
+  const [isSessionReady, setIsSessionReady] = useState(!initialSession.user);
   const viewRef = useRef(view);
   const userRef = useRef(user);
   const invoiceBackViewRef = useRef(invoiceBackView);
@@ -2555,6 +2655,14 @@ export default function App() {
     let isCancelled = false;
 
     const validateSession = async () => {
+      if (!sessionStorage.getItem(SESSION_STORAGE_KEY)) {
+        clearStoredSession();
+        setUser(null);
+        setView('welcome');
+        setIsSessionReady(true);
+        return;
+      }
+
       const validUser = await validateStoredUserWithDbFallback(user);
 
       if (isCancelled) return;
@@ -2563,14 +2671,17 @@ export default function App() {
         clearStoredSession();
         setUser(null);
         setView('welcome');
+        setIsSessionReady(true);
         return;
       }
 
-      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(validUser));
+      storeSessionUser(validUser);
 
       if (isRestorableView(view, validUser)) {
-        localStorage.setItem(LAST_VIEW_STORAGE_KEY, view);
+        sessionStorage.setItem(LAST_VIEW_STORAGE_KEY, view);
       }
+
+      setIsSessionReady(true);
     };
 
     validateSession();
@@ -2584,23 +2695,21 @@ export default function App() {
     if (!user) return undefined;
 
     const validateActiveSession = async () => {
-      const validUser = await validateStoredUserWithDbFallback(user);
-
-      if (!localStorage.getItem(SESSION_STORAGE_KEY) || !validUser || hasBackgroundSessionTimedOut()) {
+      if (!sessionStorage.getItem(SESSION_STORAGE_KEY)) {
         clearStoredSession();
         setUser(null);
         setView('welcome');
         setToast({ message: 'Sesi berakhir. Silakan masuk kembali.', type: 'error' });
-      } else {
-        clearBackgroundTimestamp();
+        return;
       }
-    };
 
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        markAppBackgrounded();
-      } else {
-        validateActiveSession();
+      const validUser = await validateStoredUserWithDbFallback(user);
+
+      if (!validUser) {
+        clearStoredSession();
+        setUser(null);
+        setView('welcome');
+        setToast({ message: 'Sesi berakhir. Silakan masuk kembali.', type: 'error' });
       }
     };
 
@@ -2611,24 +2720,17 @@ export default function App() {
     };
 
     window.addEventListener('storage', handleStorageChange);
-    window.addEventListener('blur', markAppBackgrounded);
     window.addEventListener('focus', validateActiveSession);
-    window.addEventListener('pagehide', markAppBackgrounded);
     window.addEventListener('pageshow', handlePageShow);
-    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       window.removeEventListener('storage', handleStorageChange);
-      window.removeEventListener('blur', markAppBackgrounded);
       window.removeEventListener('focus', validateActiveSession);
-      window.removeEventListener('pagehide', markAppBackgrounded);
       window.removeEventListener('pageshow', handlePageShow);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [user]);
 
   const handleLoginSuccess = (userData) => {
-    clearBackgroundTimestamp();
-    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(userData));
+    storeSessionUser(userData);
     setUser(userData);
     showToast(`Selamat datang, ${userData.name}`);
     setView('modules');
@@ -2675,7 +2777,7 @@ export default function App() {
     <div className={theme === 'dark' ? 'dark' : ''}>
       <AppContext.Provider value={{ user, showToast, theme, toggleTheme }}>
         <div className="min-h-[100dvh] overflow-x-hidden bg-slate-50 dark:bg-[#070b14] text-slate-900 dark:text-slate-200 transition-colors duration-300 flex flex-col">
-          {isBooting ? (
+          {isBooting || !isSessionReady ? (
             <SplashScreen />
           ) : <>
             {view === 'welcome' && <WelcomeView onNext={() => setView('login')} />}

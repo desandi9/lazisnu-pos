@@ -6,6 +6,8 @@ const notConfiguredResult = {
   error: 'Supabase belum dikonfigurasi.'
 };
 
+const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
+
 export const mapDbUserToUi = (user) => ({
   id: user.id,
   localId: user.local_id || null,
@@ -97,6 +99,46 @@ export async function updateUserInDb(userId, payload) {
 
 export async function setUserStatusInDb(userId, status) {
   return updateUserInDb(userId, { status });
+}
+
+export async function deleteUserFromDb(userId) {
+  if (!isSupabaseConfigured()) return notConfiguredResult;
+  if (!isUuid(userId)) return { success: false, status: 'error', error: 'ID pengguna database tidak valid.' };
+
+  try {
+    const { data, error } = await supabase.from('users').delete().eq('id', userId).select('id');
+    if (error) throw error;
+
+    return { success: true, data: data || [] };
+  } catch (error) {
+    return { success: false, status: 'error', error: error.message || 'Gagal menghapus pengguna.' };
+  }
+}
+
+export async function checkUserHasTransactions(user) {
+  if (!isSupabaseConfigured()) return notConfiguredResult;
+
+  try {
+    const checks = [];
+
+    if (isUuid(user?.id)) {
+      checks.push(supabase.from('transactions').select('id').eq('petugas_id', user.id).limit(1));
+    }
+
+    if (user?.name) {
+      checks.push(supabase.from('transactions').select('id').eq('nama_petugas_snapshot', user.name).limit(1));
+    }
+
+    if (checks.length === 0) return { success: true, data: false };
+
+    const results = await Promise.all(checks);
+    const errorResult = results.find(result => result.error);
+    if (errorResult) throw errorResult.error;
+
+    return { success: true, data: results.some(result => (result.data || []).length > 0) };
+  } catch (error) {
+    return { success: false, status: 'error', error: error.message || 'Gagal mengecek transaksi pengguna.' };
+  }
 }
 
 export async function upsertUsersToDb(users) {
