@@ -26,6 +26,10 @@ import {
   syncTransactionsCacheFromDb,
   updateTransactionSyncStatusInDb
 } from './services/database/dbTransactionService';
+import {
+  syncProfitSharingSettingsCacheFromDb,
+  upsertProfitSharingSettingsToDb
+} from './services/database/dbProfitSharingService';
 import { 
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
@@ -2009,6 +2013,9 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         const productsResult = await syncProductsCacheFromDb();
         if (!productsResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
 
+        const profitSettingsResult = await syncProfitSharingSettingsCacheFromDb();
+        if (!profitSettingsResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
+
         const transactionDraft = db.buildTransaction(txPayload);
         const createResult = await createTransactionInDb(transactionDraft);
         if (!createResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
@@ -2232,17 +2239,79 @@ const InvoiceView = ({ invoiceData, setView, backView = 'sales' }) => {
 
 const ProfitSettingsView = ({ showToast }) => {
   const [profitSettings, setProfitSettings] = useState(() => db.getProfitSharingSettings());
+  const [profitSettingsSource, setProfitSettingsSource] = useState('Lokal');
+  const [isSavingProfitSettings, setIsSavingProfitSettings] = useState(false);
   const profitTotalPercent = Number(profitSettings.lazisnuPercent) + Number(profitSettings.pcnuPercent) + Number(profitSettings.petugasPercent) + Number(profitSettings.pengelolaPercent);
 
-  const handleSaveProfitSettings = (e) => {
-    e.preventDefault();
+  useEffect(() => {
+    let isMounted = true;
 
+    queueMicrotask(async () => {
+      const result = await syncProfitSharingSettingsCacheFromDb();
+
+      if (!isMounted) return;
+
+      if (result.success && result.data) {
+        setProfitSettings(result.data);
+        setProfitSettingsSource('Database');
+        return;
+      }
+
+      setProfitSettings(db.getProfitSharingSettings());
+      setProfitSettingsSource('Lokal');
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const validateProfitSettings = () => {
+    const nextSettings = {
+      lazisnuPercent: Number(profitSettings.lazisnuPercent),
+      pcnuPercent: Number(profitSettings.pcnuPercent),
+      petugasPercent: Number(profitSettings.petugasPercent),
+      pengelolaPercent: Number(profitSettings.pengelolaPercent)
+    };
+
+    if (Object.values(nextSettings).some(value => Number.isNaN(value) || value < 0)) {
+      throw new Error('Semua persentase harus angka 0 atau lebih.');
+    }
+
+    if (nextSettings.lazisnuPercent + nextSettings.pcnuPercent + nextSettings.petugasPercent + nextSettings.pengelolaPercent !== 100) {
+      throw new Error('Total pembagian laba harus 100%.');
+    }
+
+    return nextSettings;
+  };
+
+  const handleSaveProfitSettings = async (e) => {
+    e.preventDefault();
+    if (isSavingProfitSettings) return;
+
+    setIsSavingProfitSettings(true);
     try {
-      const savedSettings = db.saveProfitSharingSettings(profitSettings);
-      setProfitSettings(savedSettings);
-      showToast('Pengaturan pembagian laba tersimpan');
+      const nextSettings = validateProfitSettings();
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const result = await upsertProfitSharingSettingsToDb(nextSettings);
+        if (!result.success) throw new Error('Gagal menyimpan pengaturan laba ke database.');
+
+        const syncResult = await syncProfitSharingSettingsCacheFromDb();
+        setProfitSettings(syncResult.success && syncResult.data ? syncResult.data : result.data);
+        setProfitSettingsSource('Database');
+        showToast('Pengaturan laba berhasil disimpan ke database.');
+      } else {
+        const savedSettings = db.saveProfitSharingSettings(nextSettings);
+        setProfitSettings(savedSettings);
+        setProfitSettingsSource('Lokal');
+        showToast('Pengaturan pembagian laba tersimpan');
+      }
     } catch (err) {
       showToast(err.message, 'error');
+    } finally {
+      setIsSavingProfitSettings(false);
     }
   };
 
@@ -2251,6 +2320,7 @@ const ProfitSettingsView = ({ showToast }) => {
       <header className="text-center px-1 md:px-0">
         <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Pengaturan Laba</h1>
         <p className="text-slate-500 mt-1.5 text-sm md:text-base">Atur porsi persentase pembagian laba operasional.</p>
+        <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Pengaturan Laba: {profitSettingsSource}</p>
       </header>
 
       <Card className="shadow-lg border-slate-200/60 p-5 md:p-8">
@@ -2268,7 +2338,7 @@ const ProfitSettingsView = ({ showToast }) => {
           </div>
           {profitTotalPercent !== 100 && <p className="text-sm font-bold text-red-500">Total pembagian laba harus 100%.</p>}
 
-          <Button type="submit" className="w-full py-4 text-base shadow-emerald-600/20 shadow-lg">Simpan Pengaturan</Button>
+          <Button type="submit" isLoading={isSavingProfitSettings} className="w-full py-4 text-base shadow-emerald-600/20 shadow-lg">Simpan Pengaturan</Button>
         </form>
       </Card>
     </div>

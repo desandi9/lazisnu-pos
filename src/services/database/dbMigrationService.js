@@ -25,7 +25,8 @@ export async function migrateLocalDataToSupabase(localData) {
   summary.products = products.length;
 
   const settings = await upsertProfitSharingSettingsToDb(localData.profitSharingSettings || {});
-  summary.profitSharingSettings = settings ? 1 : 0;
+  if (!settings.success) throw new Error(settings.error || 'Migrasi pengaturan laba gagal.');
+  summary.profitSharingSettings = settings.data ? 1 : 0;
 
   const transactions = await upsertTransactionsToDb(localData.transactions || []);
   summary.transactions = transactions.length;
