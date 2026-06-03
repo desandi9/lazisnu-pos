@@ -93,6 +93,15 @@ const sortProductsByCategory = (products) => products.slice().sort((a, b) => {
 
   return (a.size || '').localeCompare(b.size || '', 'id-ID', { sensitivity: 'base' });
 });
+const normalizeProductSize = (size) => {
+  const trimmedSize = String(size || '').trim().replace(/\s+/g, ' ');
+
+  if (!trimmedSize) return '';
+  if (/^\d+(?:[.,]\d+)?$/u.test(trimmedSize)) return `${trimmedSize.replace(',', '.')} cm`;
+  if (/^\d+(?:[.,]\d+)?\s*cm$/iu.test(trimmedSize)) return `${trimmedSize.replace(/\s*cm$/iu, '').replace(',', '.')} cm`;
+
+  return trimmedSize;
+};
 const getRoleLabel = (role) => USER_ROLES.find(item => item.value === role)?.label || '-';
 const getStatusLabel = (status) => USER_STATUSES.find(item => item.value === status)?.label || '-';
 const getTransactionPrice = (tx) => tx.priceSnapshot ?? tx.price ?? 0;
@@ -1662,6 +1671,7 @@ const UsersView = ({ showToast }) => {
           </Card>
         </div>
       )}
+
     </div>
   );
 };
@@ -1683,9 +1693,14 @@ const ProductsView = ({ showToast }) => {
 
   const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts()));
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
+  const [isParsingImport, setIsParsingImport] = useState(false);
+  const [isImportingProducts, setIsImportingProducts] = useState(false);
   const [productSource, setProductSource] = useState('Lokal');
   const [formData, setFormData] = useState(createProductFormData);
+  const [importFileName, setImportFileName] = useState('');
+  const [importRows, setImportRows] = useState([]);
 
   const loadProducts = () => setProducts(sortProductsByCategory(db.getProducts()));
 
@@ -1730,6 +1745,192 @@ const ProductsView = ({ showToast }) => {
     };
   }, []);
 
+  const normalizeImportHeader = (value) => String(value || '').trim().toLowerCase().replace(/[\s_-]+/g, ' ');
+
+  const getImportValue = (row, aliases) => {
+    const entries = Object.entries(row).map(([key, value]) => [normalizeImportHeader(key), value]);
+    const normalizedAliases = aliases.map(normalizeImportHeader);
+    const match = entries.find(([key]) => normalizedAliases.includes(key));
+
+    return match ? match[1] : '';
+  };
+
+  const normalizeImportCategory = (value) => {
+    const normalizedValue = String(value || '').toLowerCase().replace(/[()]/g, ' ').replace(/\s+/g, ' ').trim();
+
+    if (['s', 'kecil', 'kecil s'].includes(normalizedValue)) return 'Kecil (S)';
+    if (['m', 'sedang', 'sedang m'].includes(normalizedValue)) return 'Sedang (M)';
+    if (['l', 'besar', 'besar l'].includes(normalizedValue)) return 'Besar (L)';
+
+    return PRODUCT_CATEGORIES.some(item => item.value.toLowerCase() === String(value || '').toLowerCase().trim()) ? PRODUCT_CATEGORIES.find(item => item.value.toLowerCase() === String(value || '').toLowerCase().trim()).value : '';
+  };
+
+  const parseImportNumber = (value) => {
+    if (typeof value === 'number') return value;
+
+    const rawValue = String(value || '').trim();
+    if (!rawValue) return Number.NaN;
+
+    const normalizedValue = rawValue
+      .replace(/rp/ig, '')
+      .replace(/\s/g, '')
+      .replace(/\./g, '')
+      .replace(',', '.')
+      .replace(/[^0-9.-]/g, '');
+
+    return Number(normalizedValue);
+  };
+
+  const parseImportStatus = (value) => {
+    const rawValue = String(value ?? '').trim();
+    if (!rawValue) return { value: true, isValid: true };
+
+    const normalizedValue = rawValue.toLowerCase();
+    if (['aktif', 'active', 'true', 'ya', 'yes', '1'].includes(normalizedValue)) return { value: true, isValid: true };
+    if (['nonaktif', 'inactive', 'false', 'tidak', 'no', '0'].includes(normalizedValue)) return { value: false, isValid: true };
+
+    return { value: true, isValid: false };
+  };
+
+  const getProductImportKey = (product) => [product.name, product.category, product.size]
+    .map(value => String(value || '').trim().toLowerCase())
+    .join('|');
+
+  const normalizeImportProductRow = (row, index) => {
+    const name = String(getImportValue(row, ['Nama Produk', 'nama', 'name', 'produk', 'nama produk']) || '').trim();
+    const category = normalizeImportCategory(getImportValue(row, ['Kategori', 'category']));
+    const size = normalizeProductSize(getImportValue(row, ['Ukuran', 'size']));
+    const price = parseImportNumber(getImportValue(row, ['Harga', 'price']));
+    const stock = parseImportNumber(getImportValue(row, ['Stok', 'stock']));
+    const minStockRaw = getImportValue(row, ['Stok Minimum', 'min stock', 'minStock']);
+    const minStock = String(minStockRaw ?? '').trim() === '' ? 0 : parseImportNumber(minStockRaw);
+    const status = parseImportStatus(getImportValue(row, ['Status', 'aktif', 'isActive']));
+    const errors = [];
+
+    if (!name) errors.push('Nama produk wajib');
+    if (!category) errors.push('Kategori tidak valid');
+    if (!size) errors.push('Ukuran wajib');
+    if (Number.isNaN(price) || price <= 0) errors.push('Harga harus lebih dari 0');
+    if (Number.isNaN(stock) || stock < 0) errors.push('Stok tidak boleh negatif');
+    if (Number.isNaN(minStock) || minStock < 0) errors.push('Stok minimum tidak boleh negatif');
+    if (!status.isValid) errors.push('Status tidak valid');
+
+    return {
+      rowNumber: index + 2,
+      product: {
+        name,
+        category,
+        size,
+        price: Number.isNaN(price) ? 0 : price,
+        stock: Number.isNaN(stock) ? 0 : stock,
+        minStock: Number.isNaN(minStock) ? 0 : minStock,
+        isActive: status.value
+      },
+      errors,
+      isValid: errors.length === 0
+    };
+  };
+
+  const handleImportFileChange = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+
+    if (!file) return;
+
+    setIsParsingImport(true);
+    setImportFileName(file.name);
+    try {
+      const XLSX = await import('xlsx');
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const firstSheetName = workbook.SheetNames[0];
+      if (!firstSheetName) throw new Error('File tidak memiliki sheet data.');
+
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[firstSheetName], { defval: '' })
+        .filter(row => Object.values(row).some(value => String(value || '').trim()));
+
+      setImportRows(rows.map(normalizeImportProductRow));
+      showToast(`${rows.length} baris produk terbaca.`, 'success');
+    } catch (err) {
+      setImportRows([]);
+      showToast(err.message || 'Gagal membaca file import produk.', 'error');
+    } finally {
+      setIsParsingImport(false);
+    }
+  };
+
+  const handleDownloadImportTemplate = async () => {
+    const XLSX = await import('xlsx');
+    const templateRows = [
+      { 'Nama Produk': 'Stiker Donasi Kecil', Kategori: 'Kecil (S)', Ukuran: '5', Harga: 5000, Stok: 100, 'Stok Minimum': 10, Status: 'Aktif' },
+      { 'Nama Produk': 'Stiker Donasi Sedang', Kategori: 'Sedang (M)', Ukuran: '10', Harga: 10000, Stok: 50, 'Stok Minimum': 5, Status: 'Aktif' },
+      { 'Nama Produk': 'Stiker Donasi Besar', Kategori: 'Besar (L)', Ukuran: 'A4', Harga: 25000, Stok: 20, 'Stok Minimum': 3, Status: 'Aktif' }
+    ];
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.json_to_sheet(templateRows);
+
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Template Produk');
+    XLSX.writeFile(workbook, 'template-import-produk-lazisnu.xlsx');
+  };
+
+  const handleImportProducts = async () => {
+    const validRows = importRows.filter(row => row.isValid);
+    if (validRows.length === 0 || isImportingProducts) return;
+
+    setIsImportingProducts(true);
+    try {
+      const health = await checkDatabaseConnection();
+      const sourceProducts = health.status === 'connected' ? await refreshProducts() : db.getProducts();
+      let workingProducts = [...sourceProducts];
+      const summary = { created: 0, updated: 0, failed: 0 };
+
+      for (const row of validRows) {
+        const existingProduct = workingProducts.find(product => getProductImportKey(product) === getProductImportKey(row.product));
+
+        if (health.status === 'connected') {
+          const result = existingProduct
+            ? await updateProductInDb(existingProduct.id, row.product)
+            : await createProductInDb(row.product);
+
+          if (!result.success) {
+            summary.failed++;
+            continue;
+          }
+
+          if (existingProduct) {
+            summary.updated++;
+            workingProducts = workingProducts.map(product => product.id === existingProduct.id ? result.data : product);
+          } else {
+            summary.created++;
+            workingProducts.push(result.data);
+          }
+        } else {
+          db.saveProduct(existingProduct ? { ...existingProduct, ...row.product } : row.product);
+          workingProducts = db.getProducts();
+          if (existingProduct) summary.updated++;
+          else summary.created++;
+        }
+      }
+
+      if (health.status === 'connected') {
+        await refreshProducts();
+      } else {
+        loadProducts();
+        setProductSource('Lokal');
+        showToast('Database tidak tersedia, produk disimpan lokal.', 'error');
+      }
+
+      showToast(`Import selesai. Produk baru: ${summary.created}. Produk diperbarui: ${summary.updated}. Gagal: ${summary.failed}.`, summary.failed > 0 ? 'error' : 'success');
+      setImportRows([]);
+      setImportFileName('');
+      setIsImportModalOpen(false);
+    } catch (err) {
+      showToast(err.message || 'Gagal import produk.', 'error');
+    } finally {
+      setIsImportingProducts(false);
+    }
+  };
+
   const handleSave = async (e) => {
     e.preventDefault();
     if (isSubmittingProduct) return;
@@ -1744,7 +1945,7 @@ const ProductsView = ({ showToast }) => {
     const productPayload = {
       name: formData.name.trim(),
       category: formData.category,
-      size: formData.size.trim(),
+      size: normalizeProductSize(formData.size),
       price: Number(formData.price),
       stock: Number(formData.stock),
       minStock: Number(formData.minStock),
@@ -1854,7 +2055,12 @@ const ProductsView = ({ showToast }) => {
           <p className="text-sm text-slate-500 mt-1.5">Kelola master data stiker dan pantau stok.</p>
           <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Produk: {productSource}</p>
         </div>
-        {canManageProducts && <Button onClick={() => { setFormData(createProductFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto shadow-lg"><Plus size={20} /> Tambah Produk</Button>}
+        {canManageProducts && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full sm:w-auto">
+            <Button type="button" variant="secondary" onClick={() => setIsImportModalOpen(true)} className="w-full sm:w-auto shadow-sm"><Download size={18} /> Import Produk</Button>
+            <Button onClick={() => { setFormData(createProductFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto shadow-lg"><Plus size={20} /> Tambah Produk</Button>
+          </div>
+        )}
       </header>
 
       <Card className="p-0 border-0 md:border shadow-sm overflow-hidden bg-transparent md:bg-white dark:bg-transparent md:dark:bg-[#111828]">
@@ -1942,6 +2148,82 @@ const ProductsView = ({ showToast }) => {
           </Card>
         </div>
       )}
+
+      {isImportModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">
+          <Card className="w-full max-w-5xl shadow-2xl rounded-b-none md:rounded-2xl max-h-[92dvh] overflow-y-auto animate-fade-in-up">
+            <div className="flex justify-between items-start gap-4 mb-6 sticky top-0 bg-white dark:bg-[#111828] z-10 pt-2 pb-3 border-b border-slate-100 dark:border-slate-800">
+              <div>
+                <h2 className="text-2xl font-extrabold tracking-tight">Import Produk</h2>
+                <p className="text-sm text-slate-500 mt-1">Upload file Excel (.xlsx) atau CSV dengan kolom produk.</p>
+              </div>
+              <button onClick={() => setIsImportModalOpen(false)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full shrink-0"><X size={22} /></button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 mb-5">
+              <label className="w-full min-h-[54px] inline-flex items-center justify-center px-4 py-3 rounded-2xl border-2 border-dashed border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-[#0a0f1c] text-sm font-extrabold text-slate-600 dark:text-slate-300 cursor-pointer hover:border-emerald-400 transition-colors">
+                {isParsingImport ? 'Membaca file...' : (importFileName || 'Pilih file .xlsx / .csv')}
+                <input type="file" accept=".xlsx,.csv" className="hidden" onChange={handleImportFileChange} disabled={isParsingImport} />
+              </label>
+              <Button type="button" variant="secondary" onClick={handleDownloadImportTemplate} className="w-full md:w-auto">
+                <Download size={18} /> Download Template
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-3 mb-5">
+              <div className="rounded-2xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-4 text-center">
+                <p className="text-xs font-bold uppercase text-slate-500">Total Baris</p>
+                <p className="text-2xl font-black mt-1">{importRows.length}</p>
+              </div>
+              <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-100 dark:border-emerald-500/20 p-4 text-center">
+                <p className="text-xs font-bold uppercase text-emerald-700 dark:text-emerald-400">Valid</p>
+                <p className="text-2xl font-black mt-1 text-emerald-600 dark:text-emerald-400">{importRows.filter(row => row.isValid).length}</p>
+              </div>
+              <div className="rounded-2xl bg-red-50 dark:bg-red-500/10 border border-red-100 dark:border-red-500/20 p-4 text-center">
+                <p className="text-xs font-bold uppercase text-red-700 dark:text-red-400">Error</p>
+                <p className="text-2xl font-black mt-1 text-red-600 dark:text-red-400">{importRows.filter(row => !row.isValid).length}</p>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0 pb-4 max-h-[44dvh]">
+              <table className="w-full text-left text-xs md:text-sm whitespace-nowrap bg-white dark:bg-[#111828] rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+                <thead className="bg-slate-50 dark:bg-[#0a0f1c] border-b border-slate-200 dark:border-slate-800 sticky top-0 z-10">
+                  <tr>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Nama Produk</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Kategori</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Ukuran</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Harga</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Stok</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Stok Minimum</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Status</th>
+                    <th className="p-3 font-bold text-slate-600 dark:text-slate-400">Validasi</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
+                  {importRows.map(row => (
+                    <tr key={row.rowNumber} className={row.isValid ? '' : 'bg-red-50/70 dark:bg-red-500/5'}>
+                      <td className="p-3 font-bold text-slate-900 dark:text-slate-100">{row.product.name || '-'}</td>
+                      <td className="p-3 text-slate-600 dark:text-slate-300 font-semibold">{row.product.category || '-'}</td>
+                      <td className="p-3 text-slate-600 dark:text-slate-300 font-semibold">{row.product.size || '-'}</td>
+                      <td className="p-3 font-black text-emerald-600 dark:text-emerald-400">{formatRp(row.product.price)}</td>
+                      <td className="p-3 font-bold">{row.product.stock}</td>
+                      <td className="p-3 font-bold">{row.product.minStock}</td>
+                      <td className="p-3 font-bold">{row.product.isActive ? 'Aktif' : 'Nonaktif'}</td>
+                      <td className={`p-3 font-bold ${row.isValid ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>{row.isValid ? 'Valid' : row.errors.join(', ')}</td>
+                    </tr>
+                  ))}
+                  {importRows.length === 0 && <tr><td colSpan="8" className="p-8 text-center text-slate-500 font-medium">Belum ada data preview. Pilih file import terlebih dahulu.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-3 pt-4 border-t border-slate-100 dark:border-slate-800">
+              <Button type="button" variant="secondary" className="flex-1" onClick={() => setIsImportModalOpen(false)}>Batal</Button>
+              <Button type="button" className="flex-1" isLoading={isImportingProducts} disabled={importRows.filter(row => row.isValid).length === 0 || isImportingProducts} onClick={handleImportProducts}>Import Produk Valid</Button>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 };
@@ -1950,7 +2232,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
   const { user } = useContext(AppContext);
   const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 1, paymentMethod: 'Tunai', notes: '' });
+  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '' });
   const [cartItems, setCartItems] = useState([]);
 
   useEffect(() => {
@@ -1970,12 +2252,23 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
   }, []);
 
   const selectedProduct = products.find(p => p.id === form.productId);
-  const selectedQty = Number(form.qty) || 1;
+  const selectedQty = Number(form.qty) || 0;
   const cartTotal = cartItems.reduce((sum, item) => sum + item.subtotal, 0);
+
+  const handleQtyChange = (value) => {
+    const digitsOnly = value.replace(/\D/g, '');
+
+    if (!digitsOnly) {
+      setForm(prev => ({ ...prev, qty: '' }));
+      return;
+    }
+
+    setForm(prev => ({ ...prev, qty: String(Number(digitsOnly)) }));
+  };
 
   const handleAddToCart = () => {
     if (!selectedProduct) return showToast('Pilih produk terlebih dahulu', 'error');
-    if (selectedQty < 1) return showToast('Qty minimal 1', 'error');
+    if (selectedQty < 1) return showToast('Jumlah harus lebih dari 0.', 'error');
 
     const existingItem = cartItems.find(item => item.productId === selectedProduct.id);
     const nextQty = (existingItem?.qty || 0) + selectedQty;
@@ -2001,7 +2294,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         subtotal: (Number(selectedProduct.price) || 0) * selectedQty
       }];
     });
-    setForm(prev => ({ ...prev, productId: '', qty: 1 }));
+    setForm(prev => ({ ...prev, productId: '', qty: 0 }));
   };
 
   const handleRemoveCartItem = (productId) => {
@@ -2063,7 +2356,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
       setInvoiceData(newTx);
       setInvoiceBackView('sales');
       setView('invoice');
-      setForm({ buyerName: '', productId: '', qty: 1, paymentMethod: 'Tunai', notes: '' });
+      setForm({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '' });
       setCartItems([]);
     } catch (err) {
       showToast(err.message, 'error');
@@ -2103,7 +2396,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
             />
             
             <div className="grid grid-cols-2 gap-4 md:gap-5">
-              <Input label="Jumlah (Qty)" type="number" min="1" value={form.qty} onChange={e => setForm({...form, qty: parseInt(e.target.value) || 1})} required />
+              <Input label="Jumlah (Qty)" type="number" min="0" value={form.qty} onChange={e => handleQtyChange(e.target.value)} required />
               <Button type="button" onClick={handleAddToCart} className="self-end h-[48px]">Tambah ke Keranjang</Button>
             </div>
           </div>
