@@ -7,6 +7,28 @@
 - Login petugas/admin memakai username petugas dan password yang sudah dibuat owner.
 - Owner dapat memilih tab `Owner`, lalu login dengan akun owner.
 
+## Install Aplikasi di HP/Desktop
+
+Android Chrome:
+
+1. Buka `https://lazisnu-pos.vercel.app/`.
+2. Tap menu titik tiga.
+3. Pilih `Tambahkan ke layar utama` atau `Install app`.
+4. Buka dari icon `LAZISNU POS`.
+
+iPhone Safari:
+
+1. Buka link aplikasi di Safari.
+2. Tap tombol `Share`.
+3. Pilih `Add to Home Screen` atau `Tambahkan ke Layar Utama`.
+4. Buka dari icon `LAZISNU POS`.
+
+Desktop Chrome/Edge:
+
+1. Buka link aplikasi.
+2. Klik icon install di address bar.
+3. Pilih install `LAZISNU POS`.
+
 ## Tambah Produk
 
 - Login sebagai `Owner`.
