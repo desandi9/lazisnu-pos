@@ -14,27 +14,34 @@ const getTransactionItems = (tx) => {
   if (Array.isArray(tx.items) && tx.items.length > 0) return tx.items;
 
   return [{
-    productId: tx.productId || null,
-    productNameSnapshot: tx.productNameSnapshot || tx.productName || '-',
-    productCategorySnapshot: tx.productCategorySnapshot || tx.productCategory || '-',
-    productSizeSnapshot: tx.productSizeSnapshot || tx.productSize || '-',
-    priceSnapshot: tx.priceSnapshot ?? tx.price ?? 0,
-    qty: tx.qty || 0,
-    subtotal: tx.total || ((tx.priceSnapshot ?? tx.price ?? 0) * (tx.qty || 0))
+    id: tx.productId || null,
+    productId: tx.productId || tx.product_id || null,
+    productNameSnapshot: tx.productNameSnapshot || tx.product_name_snapshot || tx.productName || tx.name || '-',
+    productCategorySnapshot: tx.productCategorySnapshot || tx.product_category_snapshot || tx.productCategory || tx.category || '-',
+    productSizeSnapshot: tx.productSizeSnapshot || tx.product_size_snapshot || tx.productSize || tx.size || '-',
+    priceSnapshot: Number(tx.priceSnapshot ?? tx.price_snapshot ?? tx.price ?? 0),
+    qty: Number(tx.qty || tx.quantity || 0),
+    subtotal: Number(tx.total || ((tx.priceSnapshot ?? tx.price_snapshot ?? tx.price ?? 0) * (tx.qty || tx.quantity || 0)))
   }];
 };
 
-const mapDbItemToUi = (item) => ({
-  dbId: item.id,
-  productId: item.product_id || null,
-  productNameSnapshot: item.product_name_snapshot || '-',
-  productCategorySnapshot: item.product_category_snapshot || '-',
-  productSizeSnapshot: item.product_size_snapshot || '-',
-  priceSnapshot: Number(item.price_snapshot || 0),
-  qty: Number(item.qty || 0),
-  subtotal: Number(item.subtotal || 0),
-  createdAt: item.created_at || null
-});
+const mapDbItemToUi = (item) => {
+  const price = Number(item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0);
+  const qty = Number(item.qty || item.quantity || 0);
+
+  return {
+    id: item.id || item.dbId || item.productId || item.product_id || null,
+    dbId: item.dbId || item.id || null,
+    productId: item.productId || item.product_id || null,
+    productNameSnapshot: item.productNameSnapshot || item.product_name_snapshot || item.name || item.productName || '-',
+    productCategorySnapshot: item.productCategorySnapshot || item.product_category_snapshot || item.category || item.productCategory || '-',
+    productSizeSnapshot: item.productSizeSnapshot || item.product_size_snapshot || item.size || item.productSize || '-',
+    priceSnapshot: price,
+    qty,
+    subtotal: Number(item.subtotal ?? (price * qty)),
+    createdAt: item.createdAt || item.created_at || null
+  };
+};
 
 export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
   const items = (itemRows || transactionRow.transaction_items || []).map(mapDbItemToUi);
@@ -103,13 +110,13 @@ export const mapTransactionToDb = (transaction, userIdByLocalId = new Map()) => 
 
 export const mapTransactionItemToDb = (item, transactionId, productIdByLocalId = new Map()) => ({
   transaction_id: transactionId,
-  product_id: isUuid(item.productId) ? item.productId : (productIdByLocalId.get(item.productId) || null),
-  product_name_snapshot: item.productNameSnapshot || item.productName || '-',
-  product_category_snapshot: item.productCategorySnapshot || item.productCategory || '-',
-  product_size_snapshot: item.productSizeSnapshot || item.productSize || '-',
-  price_snapshot: Number(item.priceSnapshot ?? item.price ?? 0),
-  qty: Number(item.qty || 0),
-  subtotal: Number(item.subtotal || 0)
+  product_id: isUuid(item.productId || item.product_id || item.id) ? (item.productId || item.product_id || item.id) : (productIdByLocalId.get(item.productId || item.product_id || item.id) || null),
+  product_name_snapshot: item.productNameSnapshot || item.product_name_snapshot || item.name || item.productName || '-',
+  product_category_snapshot: item.productCategorySnapshot || item.product_category_snapshot || item.category || item.productCategory || '-',
+  product_size_snapshot: item.productSizeSnapshot || item.product_size_snapshot || item.size || item.productSize || '-',
+  price_snapshot: Number(item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0),
+  qty: Number(item.qty || item.quantity || 0),
+  subtotal: Number(item.subtotal ?? ((item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0) * (item.qty || item.quantity || 0)))
 });
 
 export const mapTransactionToUiCache = (transaction) => ({ ...transaction });
@@ -133,14 +140,22 @@ export async function getTransactionsFromDb() {
   if (!isSupabaseConfigured()) return notConfiguredResult;
 
   try {
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('*, transaction_items(*)')
-      .order('date', { ascending: false });
+    const [{ data: transactions, error: txError }, { data: items, error: itemError }] = await Promise.all([
+      supabase.from('transactions').select('*').order('date', { ascending: false }),
+      supabase.from('transaction_items').select('*').order('created_at')
+    ]);
 
-    if (error) throw error;
+    if (txError) throw txError;
+    if (itemError) throw itemError;
 
-    return { success: true, data: (data || []).map(row => mapTransactionFromDb(row)) };
+    const groupedItems = (items || []).reduce((acc, item) => {
+      const key = item.transaction_id;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(item);
+      return acc;
+    }, {});
+
+    return { success: true, data: (transactions || []).map(tx => mapTransactionFromDb(tx, groupedItems[tx.id] || [])) };
   } catch (error) {
     return { success: false, status: 'error', error: error.message || 'Gagal mengambil data transaksi.' };
   }
@@ -214,17 +229,7 @@ export async function createTransactionInDb(transaction) {
     const itemsResult = await createTransactionItemsInDb(data.id, getTransactionItems(transaction));
     if (!itemsResult.success) throw new Error(itemsResult.error || 'Gagal menyimpan item transaksi.');
 
-    return { success: true, data: mapTransactionFromDb(data, itemsResult.data.map(item => ({
-      id: item.dbId,
-      product_id: item.productId,
-      product_name_snapshot: item.productNameSnapshot,
-      product_category_snapshot: item.productCategorySnapshot,
-      product_size_snapshot: item.productSizeSnapshot,
-      price_snapshot: item.priceSnapshot,
-      qty: item.qty,
-      subtotal: item.subtotal,
-      created_at: item.createdAt
-    }))) };
+    return { success: true, data: mapTransactionFromDb(data, itemsResult.data) };
   } catch (error) {
     return { success: false, status: 'error', error: error.message || 'Gagal menyimpan transaksi.' };
   }

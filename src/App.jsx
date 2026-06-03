@@ -94,25 +94,35 @@ const getStatusLabel = (status) => USER_STATUSES.find(item => item.value === sta
 const getTransactionPrice = (tx) => tx.priceSnapshot ?? tx.price ?? 0;
 const getTransactionItems = (tx) => {
   if (Array.isArray(tx.items) && tx.items.length > 0) {
-    return tx.items.map(item => ({
-      productId: item.productId || null,
-      productNameSnapshot: item.productNameSnapshot || item.productName || '-',
-      productCategorySnapshot: item.productCategorySnapshot || item.productCategory || '-',
-      productSizeSnapshot: item.productSizeSnapshot || item.productSize || '-',
-      priceSnapshot: item.priceSnapshot ?? item.price ?? 0,
-      qty: item.qty || 0,
-      subtotal: item.subtotal ?? ((item.priceSnapshot ?? item.price ?? 0) * (item.qty || 0))
-    }));
+    return tx.items.map(item => {
+      const price = Number(item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0);
+      const qty = Number(item.qty || item.quantity || 0);
+
+      return {
+        id: item.id || item.dbId || item.productId || item.product_id || null,
+        productId: item.productId || item.product_id || null,
+        productNameSnapshot: item.productNameSnapshot || item.product_name_snapshot || item.name || item.productName || '-',
+        productCategorySnapshot: item.productCategorySnapshot || item.product_category_snapshot || item.category || item.productCategory || '-',
+        productSizeSnapshot: item.productSizeSnapshot || item.product_size_snapshot || item.size || item.productSize || '-',
+        priceSnapshot: price,
+        qty,
+        subtotal: Number(item.subtotal ?? (price * qty))
+      };
+    });
   }
 
+  const price = getTransactionPrice(tx);
+  const qty = Number(tx.qty || tx.quantity || 0);
+
   return [{
-    productId: tx.productId || null,
-    productNameSnapshot: tx.productNameSnapshot || tx.productName || '-',
-    productCategorySnapshot: tx.productCategorySnapshot || tx.productCategory || '-',
-    productSizeSnapshot: tx.productSizeSnapshot || tx.productSize || '-',
-    priceSnapshot: getTransactionPrice(tx),
-    qty: tx.qty || 0,
-    subtotal: tx.total || (getTransactionPrice(tx) * (tx.qty || 0))
+    id: tx.productId || tx.product_id || null,
+    productId: tx.productId || tx.product_id || null,
+    productNameSnapshot: tx.productNameSnapshot || tx.product_name_snapshot || tx.productName || tx.name || '-',
+    productCategorySnapshot: tx.productCategorySnapshot || tx.product_category_snapshot || tx.productCategory || tx.category || '-',
+    productSizeSnapshot: tx.productSizeSnapshot || tx.product_size_snapshot || tx.productSize || tx.size || '-',
+    priceSnapshot: price,
+    qty,
+    subtotal: Number(tx.total || (price * qty))
   }];
 };
 const getTransactionProductCategory = (tx) => getTransactionItems(tx)[0]?.productCategorySnapshot || '-';
@@ -1985,7 +1995,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
     try {
       const txPayload = {
         buyerName: form.buyerName,
-        items: cartItems.map(item => ({ productId: item.productId, qty: item.qty })),
+        items: cartItems.map(item => ({ ...item })),
         paymentMethod: form.paymentMethod, 
         notes: form.notes,
         petugasId: user.id,
