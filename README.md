@@ -1,6 +1,6 @@
 # LAZISNU Garut POS
 
-Aplikasi POS MVP untuk pengelolaan penjualan program LAZISNU Garut. Aplikasi berjalan sebagai React + Vite app, menyimpan data utama di local storage browser, dan dapat sinkronisasi transaksi ke Google Sheets melalui Google Apps Script.
+Aplikasi POS MVP untuk pengelolaan penjualan program LAZISNU Garut. Aplikasi berjalan sebagai React + Vite app, memakai Supabase sebagai database utama jika dikonfigurasi, tetap memakai localStorage sebagai cache/fallback, dan dapat sinkronisasi transaksi ke Google Sheets melalui Google Apps Script.
 
 ## Fitur Utama
 
@@ -110,16 +110,38 @@ Catatan keamanan Phase 1:
 - Phase 1 hanya foundation dan migrasi. Read/write utama aplikasi masih localStorage.
 - Phase 2 akan mengubah aplikasi agar read/write langsung ke Supabase.
 
-## Supabase Migration Phase 2A
+## Supabase Migration Phase 2A-2E
 
-Phase 2A mulai memakai tabel `public.users` sebagai sumber utama untuk login dan menu `Data Pengguna`.
+Phase 2A-2E memindahkan data utama aplikasi ke Supabase secara bertahap. Saat database berstatus connected, Supabase menjadi source of truth dan localStorage hanya cache/fallback.
 
-- Login Owner/Admin membaca user dari Supabase jika `.env` sudah dikonfigurasi.
-- Menu `Data Pengguna` mengambil, menambah, mengedit, dan mengaktifkan/nonaktifkan user ke Supabase.
-- localStorage tetap dipakai sebagai cache dan fallback jika Supabase belum dikonfigurasi atau koneksi database gagal.
-- Session restore mengecek status user aktif dari Supabase jika tersedia, lalu fallback ke cache lokal jika database tidak tersedia.
-- Produk, transaksi, laporan, spreadsheet sync, struk, dan export laporan belum dipindah ke Supabase di Phase 2A.
-- Supabase Auth belum dipakai di Phase 2A. Password masih mengikuti tabel `users` MVP untuk transisi bertahap.
+- `public.users` menjadi sumber utama untuk login dan Data Pengguna.
+- `public.products` menjadi sumber utama untuk produk dan stok.
+- `public.transactions` dan `public.transaction_items` menjadi sumber utama untuk transaksi, laporan, struk, export, dan status sync spreadsheet.
+- `public.profit_sharing_settings` menjadi sumber utama untuk Pengaturan Laba.
+- localStorage tetap menyimpan cache `users`, `products`, `transactions`, `profitSharingSettings`, URL spreadsheet, theme, dan app settings.
+- Jika Supabase connected, data hasil fetch database menggantikan cache lokal. Data lokal-only tidak mengalahkan database.
+- Jika Supabase belum dikonfigurasi atau koneksi/database gagal, aplikasi fallback ke localStorage agar tetap bisa dipakai.
+- Google Sheets tetap dipakai sebagai arsip/export, bukan database utama aplikasi.
+- Session login memakai sessionStorage, sehingga refresh tetap login tetapi close tab/browser menghapus session.
+- Supabase Auth belum dipakai. Password masih mengikuti tabel `users` MVP untuk transisi bertahap.
+
+### Migrasi Data Lokal
+
+Tombol `Migrasi Data Lokal ke Database` tersedia di halaman `Spreadsheet` untuk Owner.
+
+- Users di-upsert berdasarkan `username`.
+- Products di-upsert berdasarkan `local_id`.
+- Transactions di-upsert berdasarkan `transaction_number`.
+- Transaction items dibuat ulang per transaksi saat migrasi agar tidak dobel.
+- Profit sharing settings mengupdate row global yang sudah ada atau membuat row default jika belum ada.
+- Migrasi tidak menghapus data lokal browser.
+
+### Cache dan Fallback
+
+- Saat user login dan database connected, aplikasi menyegarkan cache utama dari Supabase: users, products, transactions, dan profit sharing settings.
+- Menu Data Produk, Data Pengguna, Laporan, Spreadsheet, dan Pengaturan Laba juga refresh dari Supabase saat dibuka.
+- Operasi write tidak fallback diam-diam ke localStorage jika database connected tetapi operasi Supabase gagal.
+- Operasi localStorage hanya dipakai jika Supabase belum dikonfigurasi atau database tidak tersedia.
 
 ## Deploy ke Vercel
 
@@ -144,6 +166,7 @@ Panduan operator tersedia di `docs/panduan-penggunaan.md`.
 
 ## Catatan MVP
 
-- Data utama tersimpan di local storage browser/perangkat.
-- Gunakan sync Google Sheets dan export backup JSON secara berkala.
-- Jangan hapus data browser jika belum melakukan backup atau sync.
+- Dengan Supabase configured dan connected, data utama tersimpan di database Supabase.
+- localStorage masih penting sebagai cache/fallback dan backup lokal.
+- Gunakan sync Google Sheets dan export backup JSON secara berkala sebagai arsip tambahan.
+- Jangan commit file `.env` atau credential Supabase ke repository.

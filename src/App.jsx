@@ -788,6 +788,24 @@ const refreshTransactionsCacheWithFallback = async () => {
   return { data: db.getTransactions(), source: 'local', status: result.status, error: result.error };
 };
 
+const syncCoreCachesFromDb = async () => {
+  const health = await checkDatabaseConnection();
+  if (health.status !== 'connected') return { success: false, status: health.status };
+
+  const [users, products, transactions, profitSettings] = await Promise.all([
+    syncUsersCacheFromDb(),
+    syncProductsCacheFromDb(),
+    syncTransactionsCacheFromDb(),
+    syncProfitSharingSettingsCacheFromDb()
+  ]);
+
+  const results = [users, products, transactions, profitSettings];
+  const failedResult = results.find(result => !result.success);
+  if (failedResult) return { success: false, status: failedResult.status || 'error', error: failedResult.error };
+
+  return { success: true, status: 'connected' };
+};
+
 // ============================================================================
 // 2. CONTEXT & STATE MANAGEMENT
 // ============================================================================
@@ -3019,6 +3037,7 @@ export default function App() {
   const [theme, setTheme] = useState(getInitialTheme);
   const [isBooting, setIsBooting] = useState(true);
   const [isSessionReady, setIsSessionReady] = useState(!initialSession.user);
+  const [, setCacheRefreshVersion] = useState(0);
   const viewRef = useRef(view);
   const userRef = useRef(user);
   const invoiceBackViewRef = useRef(invoiceBackView);
@@ -3033,6 +3052,21 @@ export default function App() {
 
   const showToast = (message, type = 'success') => setToast({ message, type });
   const closeToast = () => setToast(null);
+
+  useEffect(() => {
+    if (!user || !isSessionReady) return;
+
+    let isCancelled = false;
+
+    queueMicrotask(async () => {
+      const result = await syncCoreCachesFromDb();
+      if (!isCancelled && result.success) setCacheRefreshVersion(version => version + 1);
+    });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [user, isSessionReady]);
 
   useEffect(() => {
     const timer = setTimeout(() => setIsBooting(false), 750);
