@@ -93,6 +93,37 @@ const sortProductsByCategory = (products) => products.slice().sort((a, b) => {
 
   return (a.size || '').localeCompare(b.size || '', 'id-ID', { sensitivity: 'base' });
 });
+const getProductStockStatus = (product) => {
+  if (Number(product.stock || 0) <= 0) return 'empty';
+  if (Number(product.stock || 0) <= Number(product.minStock || 0)) return 'critical';
+  if (!product.isActive) return 'inactive';
+
+  return 'normal';
+};
+const getProductAttentionOrder = (product) => {
+  const stockStatus = getProductStockStatus(product);
+  if (stockStatus === 'empty') return 0;
+  if (stockStatus === 'critical') return 1;
+  if (product.isActive) return 2;
+
+  return 3;
+};
+const sortProductsForInventory = (products) => products.map(product => {
+  const stock = Math.max(0, Number(product.stock || 0));
+
+  return stock <= 0 ? { ...product, stock, isActive: false } : { ...product, stock };
+}).sort((a, b) => {
+  const attentionCompare = getProductAttentionOrder(a) - getProductAttentionOrder(b);
+  if (attentionCompare !== 0) return attentionCompare;
+
+  const categoryCompare = (PRODUCT_CATEGORY_ORDER[a.category] ?? 99) - (PRODUCT_CATEGORY_ORDER[b.category] ?? 99);
+  if (categoryCompare !== 0) return categoryCompare;
+
+  const nameCompare = (a.name || '').localeCompare(b.name || '', 'id-ID', { sensitivity: 'base' });
+  if (nameCompare !== 0) return nameCompare;
+
+  return (a.size || '').localeCompare(b.size || '', 'id-ID', { sensitivity: 'base' });
+});
 const normalizeProductSize = (size) => {
   const trimmedSize = String(size || '').trim().replace(/\s+/g, ' ');
 
@@ -1736,7 +1767,8 @@ const ProductsView = ({ showToast }) => {
     isActive: product.isActive ?? true
   });
 
-  const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts()));
+  const [products, setProducts] = useState(() => sortProductsForInventory(db.getProducts()));
+  const [productFilter, setProductFilter] = useState('all');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
@@ -1747,19 +1779,19 @@ const ProductsView = ({ showToast }) => {
   const [importFileName, setImportFileName] = useState('');
   const [importRows, setImportRows] = useState([]);
 
-  const loadProducts = () => setProducts(sortProductsByCategory(db.getProducts()));
+  const loadProducts = () => setProducts(sortProductsForInventory(db.getProducts()));
 
   const refreshProducts = async () => {
     const result = await syncProductsCacheFromDb();
 
     if (result.success) {
-      const nextProducts = sortProductsByCategory(result.data);
+      const nextProducts = sortProductsForInventory(result.data);
       setProducts(nextProducts);
       setProductSource('Database');
       return nextProducts;
     }
 
-    const localProducts = sortProductsByCategory(db.getProducts());
+    const localProducts = sortProductsForInventory(db.getProducts());
     setProducts(localProducts);
     setProductSource('Lokal');
     if (result.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal.', 'error');
@@ -1776,12 +1808,12 @@ const ProductsView = ({ showToast }) => {
       if (!isMounted) return;
 
       if (result.success) {
-        setProducts(sortProductsByCategory(result.data));
+        setProducts(sortProductsForInventory(result.data));
         setProductSource('Database');
         return;
       }
 
-      setProducts(sortProductsByCategory(db.getProducts()));
+      setProducts(sortProductsForInventory(db.getProducts()));
       setProductSource('Lokal');
     });
 
@@ -2049,6 +2081,11 @@ const ProductsView = ({ showToast }) => {
   const handleActiveChange = async (product) => {
     const nextActive = !product.isActive;
 
+    if (nextActive && Number(product.stock || 0) <= 0) {
+      showToast('Produk stok habis tidak bisa diaktifkan. Tambah stok terlebih dahulu.', 'error');
+      return;
+    }
+
     try {
       const health = await checkDatabaseConnection();
 
@@ -2094,6 +2131,45 @@ const ProductsView = ({ showToast }) => {
     }
   };
 
+  const stockSummary = products.reduce((summary, product) => {
+    const stock = Number(product.stock || 0);
+    const minStock = Number(product.minStock || 0);
+    const isEmpty = stock <= 0;
+    const isCritical = stock > 0 && stock <= minStock;
+    const isActive = Boolean(product.isActive) && !isEmpty;
+
+    return {
+      total: summary.total + 1,
+      active: summary.active + (isActive ? 1 : 0),
+      critical: summary.critical + (isCritical ? 1 : 0),
+      empty: summary.empty + (isEmpty ? 1 : 0),
+      inactive: summary.inactive + (!isActive ? 1 : 0)
+    };
+  }, { total: 0, active: 0, critical: 0, empty: 0, inactive: 0 });
+
+  const productFilters = [
+    { value: 'all', label: 'Semua', count: stockSummary.total },
+    { value: 'active', label: 'Aktif', count: stockSummary.active },
+    { value: 'critical', label: 'Stok Kritis', count: stockSummary.critical },
+    { value: 'empty', label: 'Habis', count: stockSummary.empty },
+    { value: 'inactive', label: 'Nonaktif', count: stockSummary.inactive }
+  ];
+
+  const visibleProducts = products.filter(product => {
+    const stock = Number(product.stock || 0);
+    const minStock = Number(product.minStock || 0);
+    const isEmpty = stock <= 0;
+    const isCritical = stock > 0 && stock <= minStock;
+    const isActive = Boolean(product.isActive) && !isEmpty;
+
+    if (productFilter === 'active') return isActive;
+    if (productFilter === 'critical') return isCritical;
+    if (productFilter === 'empty') return isEmpty;
+    if (productFilter === 'inactive') return !isActive;
+
+    return true;
+  });
+
   return (
     <div className="space-y-6 md:space-y-8 animate-fade-in">
       <header className="flex flex-col sm:flex-row justify-between sm:items-end gap-4 px-1 md:px-0">
@@ -2109,6 +2185,36 @@ const ProductsView = ({ showToast }) => {
           </div>
         )}
       </header>
+
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+        {[
+          { label: 'Total Produk', value: stockSummary.total, className: 'bg-white dark:bg-[#111828] border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white' },
+          { label: 'Produk Aktif', value: stockSummary.active, className: 'bg-emerald-50 dark:bg-emerald-500/10 border-emerald-100 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-400' },
+          { label: 'Stok Kritis', value: stockSummary.critical, className: 'bg-amber-50 dark:bg-amber-500/10 border-amber-100 dark:border-amber-500/20 text-amber-700 dark:text-amber-400' },
+          { label: 'Stok Habis', value: stockSummary.empty, className: 'bg-red-50 dark:bg-red-500/10 border-red-100 dark:border-red-500/20 text-red-700 dark:text-red-400' },
+          { label: 'Produk Nonaktif', value: stockSummary.inactive, className: 'bg-slate-50 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300' }
+        ].map(item => (
+          <div key={item.label} className={`rounded-2xl border p-4 shadow-sm ${item.className}`}>
+            <p className="text-xs font-black uppercase tracking-wide opacity-80">{item.label}</p>
+            <p className="text-2xl md:text-3xl font-black mt-2">{item.value}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0">
+        <div className="inline-flex min-w-full md:min-w-0 gap-2 rounded-2xl bg-slate-100 dark:bg-[#0a0f1c] p-1 border border-slate-200 dark:border-slate-800">
+          {productFilters.map(filter => (
+            <button
+              key={filter.value}
+              type="button"
+              onClick={() => setProductFilter(filter.value)}
+              className={`px-4 py-2.5 rounded-xl text-xs font-black whitespace-nowrap transition-colors ${productFilter === filter.value ? 'bg-white dark:bg-[#111828] text-emerald-600 dark:text-emerald-400 shadow-sm' : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'}`}
+            >
+              {filter.label} <span className="ml-1 opacity-70">{filter.count}</span>
+            </button>
+          ))}
+        </div>
+      </div>
 
       <Card className="p-0 border-0 md:border shadow-sm overflow-hidden bg-transparent md:bg-white dark:bg-transparent md:dark:bg-[#111828]">
         {/* Desktop Table, Mobile Edge-to-Edge Scroll */}
@@ -2126,9 +2232,14 @@ const ProductsView = ({ showToast }) => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
-              {products.map(p => (
-                <tr key={p.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors">
-                  <td className="p-4 font-extrabold text-slate-900 dark:text-slate-100">{p.name}</td>
+              {visibleProducts.map(p => {
+                const stockStatus = getProductStockStatus(p);
+                const isUnavailable = !p.isActive || stockStatus === 'empty';
+                const cannotActivate = !p.isActive && Number(p.stock || 0) <= 0;
+
+                return (
+                <tr key={p.id} className={`hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors ${isUnavailable ? 'bg-slate-50/70 dark:bg-slate-800/10' : ''}`}>
+                  <td className={`p-4 font-extrabold ${isUnavailable ? 'text-slate-500 dark:text-slate-400' : 'text-slate-900 dark:text-slate-100'}`}>{p.name}</td>
                   <td className="p-4">
                     <span className="inline-flex items-center justify-center min-w-8 px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 text-xs font-black">
                       {getCategoryCode(p.category)}
@@ -2138,8 +2249,9 @@ const ProductsView = ({ showToast }) => {
                   <td className="p-4 text-slate-600 dark:text-slate-300 font-semibold">{p.size || '-'}</td>
                   <td className="p-4 text-emerald-600 font-black">{formatRp(p.price)}</td>
                   <td className="p-4 font-black text-base">
-                    {p.stock} 
-                    {p.stock <= p.minStock && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 uppercase align-middle">Kritis</span>}
+                    <span className={stockStatus === 'empty' ? 'text-red-600 dark:text-red-400' : ''}>{p.stock}</span>
+                    {stockStatus === 'empty' && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 uppercase align-middle">Habis</span>}
+                    {stockStatus === 'critical' && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 uppercase align-middle">Kritis</span>}
                   </td>
                   <td className="p-4">
                     <span className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider rounded-lg ${p.isActive ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>
@@ -2150,14 +2262,15 @@ const ProductsView = ({ showToast }) => {
                     <td className="p-4 text-right">
                       <div className="flex flex-wrap justify-end gap-2">
                         <button onClick={() => { setFormData(createProductFormData(p)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button>
-                        <button onClick={() => handleActiveChange(p)} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 ${p.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{p.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button>
+                        <button onClick={() => handleActiveChange(p)} disabled={cannotActivate} title={cannotActivate ? 'Tambah stok terlebih dahulu' : undefined} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${p.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{p.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button>
                         <button onClick={() => handleDelete(p)} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Trash2 size={18} /></button>
                       </div>
                     </td>
                   )}
                 </tr>
-              ))}
-              {products.length === 0 && <tr><td colSpan={canManageProducts ? 7 : 6} className="p-8 text-center text-slate-500">Belum ada produk.</td></tr>}
+                );
+              })}
+              {visibleProducts.length === 0 && <tr><td colSpan={canManageProducts ? 7 : 6} className="p-8 text-center text-slate-500">Tidak ada produk untuk filter ini.</td></tr>}
             </tbody>
           </table>
         </div>

@@ -19,23 +19,27 @@ export const mapProductFromDb = (row) => ({
   price: Number(row.price || 0),
   stock: Number(row.stock || 0),
   minStock: Number(row.min_stock || 0),
-  isActive: row.is_active ?? true,
+  isActive: Number(row.stock || 0) > 0 ? (row.is_active ?? true) : false,
   createdAt: row.created_at || null,
   updatedAt: row.updated_at || null
 });
 
-export const mapProductToDb = (product) => ({
-  ...(product.localId || String(product.id || '').startsWith('P-') ? { local_id: product.localId || product.id } : {}),
-  name: product.name || 'Produk',
-  category: product.category || null,
-  size: product.size || null,
-  price: Number(product.price || 0),
-  stock: Number(product.stock || 0),
-  min_stock: Number(product.minStock ?? product.min_stock ?? 0),
-  is_active: product.isActive ?? product.is_active ?? true,
-  created_at: product.createdAt || new Date().toISOString(),
-  updated_at: product.updatedAt || new Date().toISOString()
-});
+export const mapProductToDb = (product) => {
+  const stock = Number(product.stock || 0);
+
+  return {
+    ...(product.localId || String(product.id || '').startsWith('P-') ? { local_id: product.localId || product.id } : {}),
+    name: product.name || 'Produk',
+    category: product.category || null,
+    size: product.size || null,
+    price: Number(product.price || 0),
+    stock,
+    min_stock: Number(product.minStock ?? product.min_stock ?? 0),
+    is_active: stock > 0 ? (product.isActive ?? product.is_active ?? true) : false,
+    created_at: product.createdAt || new Date().toISOString(),
+    updated_at: product.updatedAt || new Date().toISOString()
+  };
+};
 
 export async function getProductsFromDb() {
   if (!isSupabaseConfigured()) return notConfiguredResult;
@@ -79,6 +83,7 @@ export async function updateProductInDb(productId, payload) {
       ...(payload.isActive !== undefined || payload.is_active !== undefined ? { is_active: payload.isActive ?? payload.is_active } : {}),
       updated_at: new Date().toISOString()
     };
+    if (row.stock !== undefined && row.stock <= 0) row.is_active = false;
     const { data, error } = await supabase.from('products').update(row).eq('id', productId).select('*').single();
     if (error) throw error;
 
