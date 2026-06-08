@@ -131,8 +131,7 @@ Catatan keamanan Phase 1:
 - Jangan pernah menaruh service role key di frontend.
 - Password pada tabel `users` masih mengikuti MVP lokal untuk kompatibilitas migrasi awal.
 - Phase 2 wajib pindah ke Supabase Auth atau hashed password proper, plus RLS policy per role.
-- Phase 1 hanya foundation dan migrasi. Read/write utama aplikasi masih localStorage.
-- Phase 2 akan mengubah aplikasi agar read/write langsung ke Supabase.
+- Phase 1 hanya foundation dan migrasi. Phase berikutnya sudah memindahkan read/write utama ke Supabase saat database connected.
 
 ## Supabase Migration Phase 2A-2E
 
@@ -148,6 +147,19 @@ Phase 2A-2E memindahkan data utama aplikasi ke Supabase secara bertahap. Saat da
 - Google Sheets tetap dipakai sebagai arsip/export, bukan database utama aplikasi.
 - Session login memakai sessionStorage, sehingga refresh tetap login tetapi close tab/browser menghapus session.
 - Supabase Auth belum dipakai. Password masih mengikuti tabel `users` MVP untuk transisi bertahap.
+
+## Security Status
+
+- Aplikasi sudah memakai Supabase sebagai database utama saat database connected.
+- Frontend hanya boleh memakai anon publishable key melalui `VITE_SUPABASE_URL` dan `VITE_SUPABASE_ANON_KEY`.
+- Jangan memakai service role key, secret key, atau credential admin Supabase di frontend/Vercel client env.
+- `.env` lokal harus tetap ignored dan tidak boleh dicommit. Gunakan `.env.example` hanya sebagai template key publishable.
+- RLS penuh belum diterapkan karena login masih MVP custom dari `public.users`.
+- Security hardening awal sudah menambahkan helper permission frontend dan guard aksi sensitif.
+- Untuk production penuh, lanjutkan migrasi ke Supabase Auth + RLS policy berbasis `auth.uid()`.
+- Google Sheets tetap dipakai sebagai arsip/laporan, bukan source of truth utama.
+- Rencana dan audit ada di `docs/security-plan.md`.
+- Draft RLS untuk tahap berikutnya ada di `docs/supabase-rls-plan.sql` dan tidak boleh langsung dijalankan sebelum Supabase Auth siap.
 
 ### Migrasi Data Lokal
 

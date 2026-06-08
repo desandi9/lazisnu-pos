@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, createContext, useContext } from 'react';
 import logoWhite from './assets/LOGO LAZISNU PUTIH.png';
 import logoColor from './assets/LOGO LAZISNU WARNA.png';
 import { checkDatabaseConnection } from './services/database/dbHealthService';
+import * as permissions from './lib/permissions';
 import { migrateLocalDataToSupabase } from './services/database/dbMigrationService';
 import {
   checkProductHasTransactions,
@@ -716,6 +717,22 @@ const clearStoredSession = () => {
   localStorage.removeItem(LAST_BACKGROUND_STORAGE_KEY);
 };
 
+const hasValidSession = (user) => Boolean(user?.id && user?.username && user?.role);
+
+const guardUserAction = (user, permissionCheck, showToast) => {
+  if (!hasValidSession(user)) {
+    showToast('Sesi tidak valid. Silakan masuk kembali.', 'error');
+    return false;
+  }
+
+  if (!permissionCheck(user)) {
+    showToast('Anda tidak memiliki akses untuk aksi ini.', 'error');
+    return false;
+  }
+
+  return true;
+};
+
 const storeSessionUser = (user) => {
   sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(toCurrentUser(user)));
 };
@@ -738,9 +755,8 @@ const migrateLegacySession = () => {
 
 const isRestorableView = (view, user) => {
   if (!RESTORABLE_VIEWS.includes(view)) return false;
-  if (['users', 'profit-settings'].includes(view) && user?.role !== 'owner') return false;
 
-  return true;
+  return permissions.canAccessView(user, view);
 };
 
 const getSafeRestoredView = (user) => {
@@ -1236,11 +1252,11 @@ const DashboardLayout = ({ children, currentView, setView, user, onLogout }) => 
     { id: 'dashboard', label: 'Overview', icon: LayoutDashboard },
     { id: 'sales', label: 'Input Penjualan', icon: ShoppingCart },
     { id: 'products', label: 'Data Produk', icon: Package },
-    ...(user.role === 'owner' ? [{ id: 'users', label: 'Pengguna', icon: User }] : []),
+    ...(permissions.canManageUsers(user) ? [{ id: 'users', label: 'Pengguna', icon: User }] : []),
     { id: 'reports', label: 'Laporan & Laba', icon: PieChart },
-    ...(user.role === 'owner' ? [{ id: 'profit-settings', label: 'Pengaturan Laba', icon: Settings }] : []),
+    ...(permissions.canManageProfitSharing(user) ? [{ id: 'profit-settings', label: 'Pengaturan Laba', icon: Settings }] : []),
     { id: 'spreadsheet', label: 'Spreadsheet', icon: Database },
-  ];
+  ].filter(item => permissions.canAccessView(user, item.id));
 
   return (
     <div className="min-h-[100dvh] overflow-x-hidden bg-slate-50 dark:bg-[#070b14] flex flex-col md:flex-row transition-colors duration-300">
@@ -1517,6 +1533,7 @@ const UsersView = ({ showToast }) => {
   const handleSave = async (e) => {
     e.preventDefault();
     if (isSubmittingUser) return;
+    if (!guardUserAction(currentUser, permissions.canManageUsers, showToast)) return;
 
     if (!formData.name.trim()) return showToast('Nama lengkap wajib diisi', 'error');
     if (!formData.username.trim()) return showToast('Username wajib diisi', 'error');
@@ -1570,6 +1587,8 @@ const UsersView = ({ showToast }) => {
   const handleStatusChange = async (selectedUser) => {
     const nextStatus = selectedUser.status === 'active' ? 'inactive' : 'active';
 
+    if (!guardUserAction(currentUser, permissions.canManageUsers, showToast)) return;
+
     try {
       const nextUsers = users.map(user => user.id === selectedUser.id ? { ...user, status: nextStatus } : user);
       const health = await checkDatabaseConnection();
@@ -1599,6 +1618,10 @@ const UsersView = ({ showToast }) => {
   ));
 
   const ensureUserCanBeDeleted = async (selectedUser, health) => {
+    if (!permissions.canDeleteUser(currentUser, selectedUser)) {
+      throw new Error(currentUser?.id === selectedUser.id || currentUser?.username === selectedUser.username ? 'Pengguna yang sedang login tidak bisa dihapus.' : 'Anda tidak memiliki akses untuk aksi ini.');
+    }
+
     if (currentUser?.id === selectedUser.id || currentUser?.username === selectedUser.username) {
       throw new Error('Pengguna yang sedang login tidak bisa dihapus.');
     }
@@ -1619,6 +1642,7 @@ const UsersView = ({ showToast }) => {
 
   const handleDeleteUser = async () => {
     if (!deleteTarget || isDeletingUser) return;
+    if (!guardUserAction(currentUser, user => permissions.canDeleteUser(user, deleteTarget), showToast)) return;
 
     setIsDeletingUser(true);
     try {
@@ -1754,7 +1778,7 @@ const UsersView = ({ showToast }) => {
 
 const ProductsView = ({ showToast }) => {
   const { user } = useContext(AppContext);
-  const canManageProducts = user?.role === 'owner';
+  const canManageProductRecords = permissions.canManageProducts(user);
 
   const createProductFormData = (product = {}) => ({
     id: product.id || null,
@@ -1955,6 +1979,7 @@ const ProductsView = ({ showToast }) => {
   const handleImportProducts = async () => {
     const validRows = importRows.filter(row => row.isValid);
     if (validRows.length === 0 || isImportingProducts) return;
+    if (!guardUserAction(user, permissions.canManageProducts, showToast)) return;
 
     setIsImportingProducts(true);
     try {
@@ -2013,6 +2038,7 @@ const ProductsView = ({ showToast }) => {
   const handleSave = async (e) => {
     e.preventDefault();
     if (isSubmittingProduct) return;
+    if (!guardUserAction(user, permissions.canManageProducts, showToast)) return;
 
     if (!formData.name.trim()) return showToast('Nama produk wajib diisi', 'error');
     if (!formData.category) return showToast('Kategori produk wajib dipilih', 'error');
@@ -2081,6 +2107,8 @@ const ProductsView = ({ showToast }) => {
   const handleActiveChange = async (product) => {
     const nextActive = !product.isActive;
 
+    if (!guardUserAction(user, permissions.canManageProducts, showToast)) return;
+
     if (nextActive && Number(product.stock || 0) <= 0) {
       showToast('Produk stok habis tidak bisa diaktifkan. Tambah stok terlebih dahulu.', 'error');
       return;
@@ -2108,6 +2136,7 @@ const ProductsView = ({ showToast }) => {
   };
 
   const handleDelete = async (product) => {
+    if (!guardUserAction(user, permissions.canDeleteProduct, showToast)) return;
     if (!window.confirm('Apakah Anda yakin ingin menghapus produk ini?')) return;
 
     try {
@@ -2178,7 +2207,7 @@ const ProductsView = ({ showToast }) => {
           <p className="text-sm text-slate-500 mt-1.5">Kelola master data stiker dan pantau stok.</p>
           <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Produk: {productSource}</p>
         </div>
-        {canManageProducts && (
+        {canManageProductRecords && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full sm:w-auto">
             <Button type="button" variant="secondary" onClick={() => setIsImportModalOpen(true)} className="w-full sm:w-auto shadow-sm"><Download size={18} /> Import Produk</Button>
             <Button onClick={() => { setFormData(createProductFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto shadow-lg"><Plus size={20} /> Tambah Produk</Button>
@@ -2228,7 +2257,7 @@ const ProductsView = ({ showToast }) => {
                 <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Harga</th>
                 <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Stok</th>
                 <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Status</th>
-                {canManageProducts && <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Aksi</th>}
+                {canManageProductRecords && <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Aksi</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
@@ -2258,7 +2287,7 @@ const ProductsView = ({ showToast }) => {
                       {p.isActive ? 'Aktif' : 'Nonaktif'}
                     </span>
                   </td>
-                  {canManageProducts && (
+                  {canManageProductRecords && (
                     <td className="p-4 text-right">
                       <div className="flex flex-wrap justify-end gap-2">
                         <button onClick={() => { setFormData(createProductFormData(p)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button>
@@ -2270,7 +2299,7 @@ const ProductsView = ({ showToast }) => {
                 </tr>
                 );
               })}
-              {visibleProducts.length === 0 && <tr><td colSpan={canManageProducts ? 7 : 6} className="p-8 text-center text-slate-500">Tidak ada produk untuk filter ini.</td></tr>}
+              {visibleProducts.length === 0 && <tr><td colSpan={canManageProductRecords ? 7 : 6} className="p-8 text-center text-slate-500">Tidak ada produk untuk filter ini.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -2464,6 +2493,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (isSubmitting) return; // Mencegah double submit
+    if (!guardUserAction(user, permissions.canCreateTransaction, showToast)) return;
     if (cartItems.length === 0) return showToast('Keranjang transaksi masih kosong', 'error');
 
     setIsSubmitting(true);
@@ -2709,6 +2739,7 @@ const InvoiceView = ({ invoiceData, setView, backView = 'sales' }) => {
 };
 
 const ProfitSettingsView = ({ showToast }) => {
+  const { user } = useContext(AppContext);
   const [profitSettings, setProfitSettings] = useState(() => db.getProfitSharingSettings());
   const [profitSettingsSource, setProfitSettingsSource] = useState('Lokal');
   const [isSavingProfitSettings, setIsSavingProfitSettings] = useState(false);
@@ -2759,6 +2790,7 @@ const ProfitSettingsView = ({ showToast }) => {
   const handleSaveProfitSettings = async (e) => {
     e.preventDefault();
     if (isSavingProfitSettings) return;
+    if (!guardUserAction(user, permissions.canManageProfitSharing, showToast)) return;
 
     setIsSavingProfitSettings(true);
     try {
@@ -3266,6 +3298,7 @@ const SpreadsheetView = ({ showToast }) => {
   }, []);
 
   const handleSaveUrl = () => {
+    if (!guardUserAction(user, permissions.canSyncSpreadsheet, showToast)) return;
     if (!webAppUrl.trim()) return showToast('Masukkan URL Google Apps Script terlebih dahulu.', 'error');
 
     db.saveSpreadsheetUrl(webAppUrl);
@@ -3273,6 +3306,7 @@ const SpreadsheetView = ({ showToast }) => {
   };
 
   const handleResetDefaultUrl = () => {
+    if (!guardUserAction(user, permissions.canSyncSpreadsheet, showToast)) return;
     const defaultUrl = db.resetSpreadsheetUrl();
 
     setWebAppUrl(defaultUrl);
@@ -3306,6 +3340,7 @@ const SpreadsheetView = ({ showToast }) => {
 
   const handleMigrateLocalData = async () => {
     if (isMigratingDatabase) return;
+    if (!guardUserAction(user, permissions.isOwner, showToast)) return;
 
     const isConfirmed = window.confirm('Data lokal akan dikirim ke Supabase. Data lokal tidak akan dihapus.');
     if (!isConfirmed) return;
@@ -3325,6 +3360,7 @@ const SpreadsheetView = ({ showToast }) => {
 
   const handleSync = async () => {
     if (isSubmitting) return; // Mencegah double submit
+    if (!guardUserAction(user, permissions.canSyncSpreadsheet, showToast)) return;
     if (!webAppUrl.trim()) return showToast('Masukkan URL Google Apps Script terlebih dahulu.', 'error');
     
     setIsSubmitting(true);
@@ -3447,7 +3483,7 @@ const SpreadsheetView = ({ showToast }) => {
               Cek Koneksi Database
             </Button>
           </div>
-          {user?.role === 'owner' && (
+          {permissions.isOwner(user) && (
             <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">Phase 1: kirim data lokal ke Supabase tanpa menghapus data browser.</p>
               <Button type="button" onClick={handleMigrateLocalData} isLoading={isMigratingDatabase} className="w-full sm:w-auto shrink-0">
@@ -3534,6 +3570,14 @@ export default function App() {
 
   useEffect(() => {
     if (!user || !INTERNAL_HISTORY_VIEWS.includes(view)) return;
+
+    if (!permissions.canAccessView(user, view)) {
+      queueMicrotask(() => {
+        setView('dashboard');
+        setToast({ message: 'Anda tidak memiliki akses untuk aksi ini.', type: 'error' });
+      });
+      return;
+    }
 
     const state = { lazisnuView: view };
 
@@ -3709,10 +3753,10 @@ export default function App() {
               <DashboardLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
                 {view === 'dashboard' && <DashboardOverview setView={setView} />}
                 {view === 'products' && <ProductsView showToast={showToast} />}
-                {view === 'users' && user.role === 'owner' && <UsersView showToast={showToast} />}
+                {view === 'users' && permissions.canManageUsers(user) && <UsersView showToast={showToast} />}
                 {view === 'sales' && <SalesView showToast={showToast} setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} />}
                 {view === 'reports' && <ReportsView setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} showToast={showToast} />}
-                {view === 'profit-settings' && user.role === 'owner' && <ProfitSettingsView showToast={showToast} />}
+                {view === 'profit-settings' && permissions.canManageProfitSharing(user) && <ProfitSettingsView showToast={showToast} />}
                 {view === 'spreadsheet' && <SpreadsheetView showToast={showToast} />}
                 {view === 'invoice' && <InvoiceView invoiceData={invoiceData} setView={setView} backView={invoiceBackView} />}
               </DashboardLayout>
