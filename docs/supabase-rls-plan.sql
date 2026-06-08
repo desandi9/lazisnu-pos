@@ -1,10 +1,13 @@
 -- LAZISNU POS - Supabase RLS Plan Draft
 -- Draft only. Do not run in production before Supabase Auth is connected.
+-- JANGAN JALANKAN FILE INI sebelum VITE_AUTH_MODE=supabase_auth aktif
+-- dan semua active users sudah punya public.users.auth_user_id.
 -- This plan requires public.users.auth_user_id to reference auth.users(id).
 -- Do not apply while the app still authenticates only with the MVP custom users table.
 
 -- Recommended profile binding for the next auth phase:
 -- alter table public.users add column if not exists auth_user_id uuid unique references auth.users(id) on delete set null;
+-- See supabase/auth-phase-schema.sql for the safer preparation-only migration.
 
 -- Helper functions for policies after Supabase Auth migration.
 create or replace function public.current_profile()
@@ -110,13 +113,13 @@ on public.products for delete
 using (public.is_owner());
 
 -- Transactions
+-- Current app policy: owner/admin can read all transactions for reports.
+-- If the organization later wants stricter admin visibility, replace select policy
+-- with: public.is_owner() or petugas_id = (select id from public.current_profile()).
 drop policy if exists "owner admin can read transactions" on public.transactions;
 create policy "owner admin can read transactions"
 on public.transactions for select
 using (public.is_admin_or_owner());
-
--- Alternative stricter admin read policy if needed later:
--- using (public.is_owner() or petugas_id = (select id from public.current_profile()))
 
 drop policy if exists "owner admin can create transactions" on public.transactions;
 create policy "owner admin can create transactions"
@@ -129,16 +132,30 @@ on public.transactions for update
 using (public.is_admin_or_owner())
 with check (public.is_admin_or_owner());
 
--- Transaction items
+-- Transaction items follow parent transaction visibility.
 drop policy if exists "owner admin can read transaction items" on public.transaction_items;
 create policy "owner admin can read transaction items"
 on public.transaction_items for select
-using (public.is_admin_or_owner());
+using (
+  public.is_admin_or_owner()
+  and exists (
+    select 1
+    from public.transactions t
+    where t.id = transaction_items.transaction_id
+  )
+);
 
 drop policy if exists "owner admin can insert transaction items" on public.transaction_items;
 create policy "owner admin can insert transaction items"
 on public.transaction_items for insert
-with check (public.is_admin_or_owner());
+with check (
+  public.is_admin_or_owner()
+  and exists (
+    select 1
+    from public.transactions t
+    where t.id = transaction_items.transaction_id
+  )
+);
 
 drop policy if exists "owner can rewrite transaction items" on public.transaction_items;
 create policy "owner can rewrite transaction items"

@@ -3,6 +3,7 @@ import logoWhite from './assets/LOGO LAZISNU PUTIH.png';
 import logoColor from './assets/LOGO LAZISNU WARNA.png';
 import { checkDatabaseConnection } from './services/database/dbHealthService';
 import * as permissions from './lib/permissions';
+import { getCurrentAuthMode } from './services/auth/authAdapter';
 import { migrateLocalDataToSupabase } from './services/database/dbMigrationService';
 import {
   checkProductHasTransactions,
@@ -3264,6 +3265,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
 
 const SpreadsheetView = ({ showToast }) => {
   const { user } = useContext(AppContext);
+  const authModeLabel = getCurrentAuthMode() === 'supabase_auth' ? 'Supabase Auth' : 'Custom Users MVP';
   const [pendingCount, setPendingCount] = useState(() => db.getPendingSyncs().length);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isCheckingDatabase, setIsCheckingDatabase] = useState(false);
@@ -3465,6 +3467,21 @@ const SpreadsheetView = ({ showToast }) => {
         </div>
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0a0f1c] p-4 md:p-5 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="rounded-xl bg-slate-50 dark:bg-[#111828] border border-slate-100 dark:border-slate-800 p-3">
+              <p className="text-[10px] font-black uppercase tracking-wider text-slate-500 dark:text-slate-400">Auth Mode</p>
+              <p className="text-sm font-extrabold text-slate-900 dark:text-white mt-1">{authModeLabel}</p>
+            </div>
+            <div className="rounded-xl bg-slate-50 dark:bg-[#111828] border border-slate-100 dark:border-slate-800 p-3">
+              <p className="text-[10px] font-black uppercase tracking-wider text-slate-500 dark:text-slate-400">Database Security</p>
+              <p className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 mt-1">RLS Plan Ready</p>
+            </div>
+            <div className="rounded-xl bg-slate-50 dark:bg-[#111828] border border-slate-100 dark:border-slate-800 p-3">
+              <p className="text-[10px] font-black uppercase tracking-wider text-slate-500 dark:text-slate-400">RLS Active</p>
+              <p className="text-sm font-extrabold text-red-600 dark:text-red-400 mt-1">No</p>
+            </div>
+          </div>
+
           <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
             <div>
               <h2 className="text-sm md:text-base font-extrabold text-slate-900 dark:text-white">Status Database</h2>
