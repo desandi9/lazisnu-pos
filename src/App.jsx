@@ -198,6 +198,21 @@ const calculateProfitSharing = (total, settings) => ({
   pengelolaAmount: Math.round(total * settings.pengelolaPercent / 100)
 });
 
+const calculateLpnuTotals = (items, biayaOperasional = 0) => {
+  const totalModal = items.reduce((sum, item) => sum + Number(item.subtotalModal || 0), 0);
+  const totalJual = items.reduce((sum, item) => sum + Number(item.subtotalJual || 0), 0);
+  const labaKotor = totalJual - totalModal;
+  const biaya = Number(biayaOperasional || 0);
+
+  return {
+    totalModal,
+    totalJual,
+    labaKotor,
+    biayaOperasional: biaya,
+    labaBersih: labaKotor - biaya
+  };
+};
+
 const normalizeUser = (user, index = 0) => {
   const now = new Date().toISOString();
 
@@ -684,6 +699,115 @@ class DatabaseService {
       throw error;
     }
   }
+
+  getLpnuProducts() { return this._get('lpnuProducts'); }
+
+  saveLpnuProduct(product) {
+    const products = this.getLpnuProducts();
+    const existingIndex = products.findIndex(item => item.id === product.id);
+    const now = new Date().toISOString();
+    const stock = Math.max(0, Number(product.stock || 0));
+    const nextProduct = {
+      ...product,
+      name: String(product.name || '').trim(),
+      category: String(product.category || '').trim(),
+      unit: String(product.unit || '').trim(),
+      supplier: String(product.supplier || '').trim(),
+      costPrice: Number(product.costPrice || 0),
+      sellingPrice: Number(product.sellingPrice || 0),
+      stock,
+      minStock: Number(product.minStock || 0),
+      isActive: stock > 0 ? Boolean(product.isActive) : false,
+      updatedAt: now
+    };
+
+    if (existingIndex >= 0) {
+      products[existingIndex] = { ...products[existingIndex], ...nextProduct };
+    } else {
+      products.push({ ...nextProduct, id: `LPNU-P-${Date.now()}`, createdAt: now });
+    }
+
+    this._set('lpnuProducts', products);
+  }
+
+  deleteLpnuProduct(id) {
+    if (this.getLpnuTransactions().some(tx => tx.items?.some(item => item.productId === id))) {
+      throw new Error('Produk LPNU sudah memiliki transaksi. Nonaktifkan saja agar riwayat tetap aman.');
+    }
+
+    this._set('lpnuProducts', this.getLpnuProducts().filter(product => product.id !== id));
+  }
+
+  getLpnuTransactions() { return this._get('lpnuTransactions'); }
+
+  addLpnuTransaction(txData) {
+    const products = this.getLpnuProducts();
+    const requestedItems = Array.isArray(txData.items) ? txData.items : [];
+    if (requestedItems.length === 0) throw new Error('Keranjang transaksi masih kosong.');
+
+    const items = requestedItems.map(item => {
+      const productIndex = products.findIndex(product => product.id === item.productId);
+      if (productIndex === -1) throw new Error('Produk LPNU tidak ditemukan.');
+
+      const product = products[productIndex];
+      const qty = Number(item.qty || 0);
+      if (qty < 1) throw new Error('Qty tidak valid.');
+      if (product.stock < qty) throw new Error('Stok tidak mencukupi.');
+
+      const costPriceSnapshot = Number(product.costPrice || 0);
+      const sellingPriceSnapshot = Number(product.sellingPrice || 0);
+      const subtotalModal = costPriceSnapshot * qty;
+      const subtotalJual = sellingPriceSnapshot * qty;
+
+      return {
+        productIndex,
+        productId: product.id,
+        productNameSnapshot: product.name || '-',
+        categorySnapshot: product.category || '-',
+        unitSnapshot: product.unit || '-',
+        costPriceSnapshot,
+        sellingPriceSnapshot,
+        qty,
+        subtotalModal,
+        subtotalJual,
+        margin: subtotalJual - subtotalModal
+      };
+    });
+
+    items.forEach(item => {
+      products[item.productIndex].stock -= item.qty;
+      if (products[item.productIndex].stock <= 0) {
+        products[item.productIndex].stock = 0;
+        products[item.productIndex].isActive = false;
+      }
+    });
+    this._set('lpnuProducts', products);
+
+    const cleanItems = items.map(item => {
+      const nextItem = { ...item };
+      delete nextItem.productIndex;
+      return nextItem;
+    });
+    const totals = calculateLpnuTotals(cleanItems, txData.biayaOperasional);
+    const transactionNumber = `LPNU-TX-${Date.now()}`;
+    const newTx = {
+      id: transactionNumber,
+      transactionNumber,
+      date: new Date().toISOString(),
+      buyerName: txData.buyerName || 'Hamba Allah',
+      petugasId: txData.petugasId || null,
+      namaPetugasSnapshot: txData.namaPetugasSnapshot || '-',
+      items: cleanItems,
+      ...totals,
+      paymentMethod: txData.paymentMethod || 'Tunai',
+      notes: txData.notes || '',
+      syncStatus: 'pending',
+      syncedAt: null
+    };
+
+    this._set('lpnuTransactions', [newTx, ...this.getLpnuTransactions()]);
+    return newTx;
+  }
 }
 
 const db = new DatabaseService();
@@ -693,8 +817,10 @@ const LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view_session';
 const LEGACY_SESSION_STORAGE_KEY = 'lazisnu_current_user';
 const LEGACY_LAST_VIEW_STORAGE_KEY = 'lazisnu_last_view';
 const LAST_BACKGROUND_STORAGE_KEY = 'lazisnu_last_background_at';
-const RESTORABLE_VIEWS = ['dashboard', 'sales', 'products', 'reports', 'users', 'profit-settings', 'spreadsheet'];
-const INTERNAL_HISTORY_VIEWS = ['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'];
+const LPNU_VIEWS = ['lpnu-dashboard', 'lpnu-sales', 'lpnu-products', 'lpnu-stock', 'lpnu-reports', 'lpnu-finance', 'lpnu-spreadsheet', 'lpnu-settings'];
+const STIKERNISASI_VIEWS = ['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'];
+const RESTORABLE_VIEWS = ['dashboard', 'sales', 'products', 'reports', 'users', 'profit-settings', 'spreadsheet', ...LPNU_VIEWS];
+const INTERNAL_HISTORY_VIEWS = [...STIKERNISASI_VIEWS, ...LPNU_VIEWS];
 
 const applyTheme = (theme) => {
   document.documentElement.classList.toggle('dark', theme === 'dark');
@@ -1209,7 +1335,7 @@ const LoginView = ({ onLoginSuccess, showToast }) => {
 // 5. MODULE SELECTION & DASHBOARD LAYOUT
 // ============================================================================
 
-const ModuleSelectionView = ({ onSelectModule, showToast }) => {
+const ModuleSelectionView = ({ onSelectModule }) => {
   const { theme } = useContext(AppContext);
 
   return (
@@ -1231,12 +1357,12 @@ const ModuleSelectionView = ({ onSelectModule, showToast }) => {
           <div className="inline-flex items-center text-emerald-600 dark:text-emerald-400 font-semibold bg-emerald-50 dark:bg-emerald-900/20 px-4 py-2.5 rounded-xl text-sm md:text-base">Masuk Modul <ArrowRight size={18} className="ml-2" /></div>
         </button>
 
-        <button onClick={() => showToast('Modul Produk Lazisnu x LPNU Garut belum tersedia saat ini.', 'error')} className="relative bg-slate-100/50 dark:bg-[#111828]/40 border border-slate-200/50 dark:border-slate-800/50 rounded-3xl p-6 md:p-8 text-left opacity-80 active:scale-[0.98] transition-transform overflow-hidden">
-          <div className="absolute top-5 right-5 bg-slate-200 dark:bg-slate-800 text-[10px] md:text-xs font-bold text-slate-600 dark:text-slate-300 px-3 py-1.5 rounded-lg uppercase tracking-wider">Coming Soon</div>
-          <div className="w-14 h-14 md:w-16 md:h-16 bg-slate-200 dark:bg-slate-800 text-slate-500 rounded-2xl flex items-center justify-center mb-5 md:mb-6"><ShoppingCart size={28} /></div>
-          <h3 className="text-xl md:text-2xl font-bold text-slate-700 dark:text-slate-300 mb-2 md:mb-3">Produk Lazisnu x LPNU Garut</h3>
-          <p className="text-sm md:text-base text-slate-500 mb-6 md:mb-8 leading-relaxed">Kolaborasi penjualan produk unggulan bersama LPNU Garut.</p>
-          <div className="inline-flex items-center text-slate-500 font-semibold bg-slate-200 dark:bg-slate-800 px-4 py-2.5 rounded-xl text-sm md:text-base">Belum Tersedia</div>
+        <button onClick={() => onSelectModule('lpnu-dashboard')} className="group relative bg-white dark:bg-[#111828] border border-slate-200 dark:border-slate-800 hover:border-blue-500/50 dark:hover:border-blue-500/50 rounded-3xl p-6 md:p-8 text-left transition-all hover:shadow-xl md:hover:-translate-y-1 active:scale-[0.98] overflow-hidden">
+          <div className="absolute top-5 right-5 bg-blue-50 dark:bg-blue-900/20 text-[10px] md:text-xs font-bold text-blue-600 dark:text-blue-400 px-3 py-1.5 rounded-lg uppercase tracking-wider">Aktif</div>
+          <div className="w-14 h-14 md:w-16 md:h-16 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-2xl flex items-center justify-center mb-5 md:mb-6 group-hover:scale-110 transition-transform"><ShoppingCart size={28} /></div>
+          <h3 className="text-xl md:text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2 md:mb-3">Produk LAZISNU x LPNU Garut</h3>
+          <p className="text-sm md:text-base text-slate-600 dark:text-slate-400 mb-6 md:mb-8 leading-relaxed">Kelola produk kolaborasi LAZISNU dan LPNU Garut.</p>
+          <div className="inline-flex items-center text-blue-600 dark:text-blue-400 font-semibold bg-blue-50 dark:bg-blue-900/20 px-4 py-2.5 rounded-xl text-sm md:text-base">Masuk Modul <ArrowRight size={18} className="ml-2" /></div>
         </button>
       </div>
     </div>
@@ -1340,6 +1466,329 @@ const DashboardLayout = ({ children, currentView, setView, user, onLogout }) => 
     </div>
   );
 };
+
+const LpnuLayout = ({ children, currentView, setView, user, onLogout }) => {
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const { theme, toggleTheme } = useContext(AppContext);
+  const navItems = [
+    { id: 'lpnu-dashboard', label: 'Overview LPNU', icon: LayoutDashboard },
+    { id: 'lpnu-sales', label: 'Penjualan LPNU', icon: ShoppingCart },
+    { id: 'lpnu-products', label: 'Produk LPNU', icon: Package },
+    { id: 'lpnu-stock', label: 'Stok LPNU', icon: AlertTriangle },
+    { id: 'lpnu-reports', label: 'Laporan LPNU', icon: FileText },
+    { id: 'lpnu-finance', label: 'Keuangan LPNU', icon: PieChart },
+    { id: 'lpnu-spreadsheet', label: 'Spreadsheet LPNU', icon: Database },
+    { id: 'lpnu-settings', label: 'Pengaturan LPNU', icon: Settings }
+  ];
+
+  return (
+    <div className="min-h-[100dvh] overflow-x-hidden bg-slate-50 dark:bg-[#070b14] flex flex-col md:flex-row transition-colors duration-300">
+      <div className="md:hidden bg-white/90 backdrop-blur-md dark:bg-[#0a0f1c]/90 border-b border-slate-200 dark:border-slate-800 px-4 py-3 flex items-center justify-between z-30 sticky top-0 shadow-sm">
+        <div className="flex items-center gap-2.5">
+          <div className="bg-white dark:bg-[#111828] border border-slate-200 dark:border-slate-800 px-2 py-1.5 rounded-lg"><LazisnuLogo variant={theme === 'dark' ? 'white' : 'color'} size="sm" /></div>
+          <span className="font-extrabold text-base text-slate-900 dark:text-white tracking-tight leading-tight">LPNU GARUT</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={toggleTheme} className="w-11 h-11 flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition-colors">{theme === 'dark' ? <Sun size={22} /> : <Moon size={22} />}</button>
+          <button onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)} className="w-11 h-11 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition-colors">{isMobileMenuOpen ? <X size={26}/> : <Menu size={26}/>}</button>
+        </div>
+      </div>
+
+      <aside className={`fixed md:sticky top-0 left-0 h-[100dvh] w-[280px] bg-white dark:bg-[#0a0f1c] border-r border-slate-200 dark:border-slate-800 p-5 flex flex-col transition-transform duration-300 z-40 shadow-2xl md:shadow-none dark:shadow-none ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}>
+        <div className="hidden md:flex items-center gap-3 px-2 mb-8 mt-2">
+          <div className="bg-white dark:bg-[#111828] border border-slate-200 dark:border-slate-800 px-3 py-2 rounded-xl shadow-sm"><LazisnuLogo variant={theme === 'dark' ? 'white' : 'color'} size="sm" /></div>
+          <div>
+            <h2 className="font-extrabold text-lg text-slate-900 dark:text-white leading-tight tracking-tight">LPNU</h2>
+            <p className="text-[11px] text-blue-600 dark:text-blue-400 font-bold tracking-widest uppercase">Produk Kolaborasi</p>
+          </div>
+        </div>
+
+        <div className="mb-4 px-2">
+          <button onClick={() => { setView('modules'); setIsMobileMenuOpen(false); }} className="w-full px-4 py-3 rounded-xl text-xs font-black text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800/40">Ganti Modul</button>
+        </div>
+
+        <nav className="flex-1 space-y-2 overflow-y-auto pr-2 pb-6">
+          {navItems.map(item => (
+            <button key={item.id} onClick={() => { setView(item.id); setIsMobileMenuOpen(false); }} className={`w-full flex items-center gap-4 px-4 py-3.5 rounded-xl text-sm md:text-base font-bold transition-all select-none ${currentView === item.id ? 'bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20' : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}>
+              <item.icon size={22} className={currentView === item.id ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400'} />
+              {item.label}
+            </button>
+          ))}
+        </nav>
+
+        <div className="border-t border-slate-200 dark:border-slate-800 pt-5 mt-auto space-y-3">
+          <div className="hidden md:flex px-4 py-3 bg-slate-50 dark:bg-[#111828] rounded-xl border border-slate-200 dark:border-slate-800 items-center gap-3">
+            <div className="bg-slate-200 dark:bg-slate-700 p-2 rounded-lg text-slate-500 dark:text-slate-400"><User size={18} /></div>
+            <div className="overflow-hidden">
+              <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Login Sebagai</p>
+              <p className="text-sm font-bold text-slate-900 dark:text-slate-200 capitalize truncate">{user.name}</p>
+            </div>
+          </div>
+          <button onClick={onLogout} className="w-full flex items-center justify-center gap-2 px-4 py-3.5 md:py-3 text-sm font-bold text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-colors select-none"><LogOut size={20} className="md:w-[18px] md:h-[18px]" /> Keluar</button>
+        </div>
+      </aside>
+
+      <main className="flex-1 w-full p-4 sm:p-6 md:p-10 overflow-visible md:overflow-y-auto md:h-screen relative">
+        {isMobileMenuOpen && <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-30 md:hidden transition-opacity" onClick={() => setIsMobileMenuOpen(false)} />}
+        <div className="max-w-6xl mx-auto pb-[calc(8rem+env(safe-area-inset-bottom))] md:pb-10">{children}</div>
+      </main>
+    </div>
+  );
+};
+
+const getLpnuProductStockStatus = (product) => {
+  if (Number(product.stock || 0) <= 0) return 'empty';
+  if (Number(product.stock || 0) <= Number(product.minStock || 0)) return 'critical';
+  if (!product.isActive) return 'inactive';
+  return 'normal';
+};
+
+const sortLpnuProducts = (products) => products.slice().sort((a, b) => {
+  const statusOrder = { empty: 0, critical: 1, normal: 2, inactive: 3 };
+  const statusCompare = (statusOrder[getLpnuProductStockStatus(a)] ?? 9) - (statusOrder[getLpnuProductStockStatus(b)] ?? 9);
+  if (statusCompare !== 0) return statusCompare;
+
+  return (a.name || '').localeCompare(b.name || '', 'id-ID', { sensitivity: 'base' });
+});
+
+const LpnuOverviewView = ({ setView }) => {
+  const products = db.getLpnuProducts();
+  const transactions = db.getLpnuTransactions();
+  const stats = {
+    totalProducts: products.length,
+    totalStock: products.reduce((sum, product) => sum + Number(product.stock || 0), 0),
+    omzet: transactions.reduce((sum, tx) => sum + Number(tx.totalJual || 0), 0),
+    labaKotor: transactions.reduce((sum, tx) => sum + Number(tx.labaKotor || 0), 0),
+    labaBersih: transactions.reduce((sum, tx) => sum + Number(tx.labaBersih || 0), 0),
+    criticalStock: products.filter(product => product.stock > 0 && product.stock <= product.minStock).length
+  };
+
+  return (
+    <div className="space-y-6 md:space-y-8 animate-fade-in">
+      <header className="px-1 md:px-0">
+        <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Overview LPNU</h1>
+        <p className="text-sm text-slate-500 mt-1.5">Ringkasan produk kolaborasi LAZISNU dan LPNU Garut.</p>
+      </header>
+
+      <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+        {[
+          ['Total Produk LPNU', stats.totalProducts],
+          ['Total Stok', stats.totalStock],
+          ['Omzet LPNU', formatRp(stats.omzet)],
+          ['Laba Kotor', formatRp(stats.labaKotor)],
+          ['Laba Bersih', formatRp(stats.labaBersih)],
+          ['Stok Kritis', stats.criticalStock]
+        ].map(([label, value]) => (
+          <Card key={label} className="p-4 border-slate-200/70 shadow-sm">
+            <p className="text-[11px] font-black uppercase tracking-wide text-slate-500">{label}</p>
+            <p className="text-xl md:text-2xl font-black mt-2 text-slate-900 dark:text-white">{value}</p>
+          </Card>
+        ))}
+      </div>
+
+      <Card className="p-5 md:p-6 border-blue-100 dark:border-blue-500/20 bg-blue-50/60 dark:bg-blue-500/10">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">Akses Cepat LPNU</h2>
+            <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Mulai input penjualan atau kelola produk LPNU.</p>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full md:w-auto">
+            <Button type="button" onClick={() => setView('lpnu-sales')} className="w-full md:w-auto bg-blue-600 hover:bg-blue-700"><ShoppingCart size={18} /> Penjualan LPNU</Button>
+            <Button type="button" variant="secondary" onClick={() => setView('lpnu-products')} className="w-full md:w-auto"><Package size={18} /> Produk LPNU</Button>
+          </div>
+        </div>
+      </Card>
+
+      {products.length === 0 && transactions.length === 0 && (
+        <Card className="p-8 text-center border-dashed">
+          <p className="font-extrabold text-slate-900 dark:text-white">Data LPNU masih kosong.</p>
+          <p className="text-sm text-slate-500 mt-2">Tambahkan produk LPNU terlebih dahulu untuk mulai menggunakan modul ini.</p>
+        </Card>
+      )}
+    </div>
+  );
+};
+
+const LpnuProductsView = ({ showToast }) => {
+  const createFormData = (product = {}) => ({
+    id: product.id || null,
+    name: product.name || '',
+    category: product.category || '',
+    unit: product.unit || 'pcs',
+    costPrice: product.costPrice ?? '',
+    sellingPrice: product.sellingPrice ?? '',
+    stock: product.stock ?? '',
+    minStock: product.minStock ?? '5',
+    supplier: product.supplier || '',
+    isActive: product.isActive ?? true
+  });
+  const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts()));
+  const [formData, setFormData] = useState(createFormData);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  const loadProducts = () => setProducts(sortLpnuProducts(db.getLpnuProducts()));
+
+  const handleSave = (event) => {
+    event.preventDefault();
+    if (!formData.name.trim()) return showToast('Nama produk wajib diisi.', 'error');
+    if (Number(formData.costPrice) < 0) return showToast('Harga modal tidak boleh negatif.', 'error');
+    if (Number(formData.sellingPrice) <= 0) return showToast('Harga jual harus lebih dari 0.', 'error');
+    if (Number(formData.stock) < 0) return showToast('Stok tidak boleh negatif.', 'error');
+    if (Number(formData.sellingPrice) < Number(formData.costPrice) && !window.confirm('Harga jual lebih kecil dari harga modal. Tetap simpan produk ini?')) return;
+
+    db.saveLpnuProduct({
+      ...formData,
+      costPrice: Number(formData.costPrice || 0),
+      sellingPrice: Number(formData.sellingPrice || 0),
+      stock: Number(formData.stock || 0),
+      minStock: Number(formData.minStock || 0),
+      isActive: Number(formData.stock || 0) > 0 ? formData.isActive : false
+    });
+    loadProducts();
+    setIsModalOpen(false);
+    showToast('Produk LPNU tersimpan.');
+  };
+
+  const handleActiveChange = (product) => {
+    if (!product.isActive && Number(product.stock || 0) <= 0) return showToast('Produk stok habis tidak bisa diaktifkan. Tambah stok terlebih dahulu.', 'error');
+    db.saveLpnuProduct({ ...product, isActive: !product.isActive });
+    loadProducts();
+    showToast(product.isActive ? 'Produk LPNU dinonaktifkan.' : 'Produk LPNU diaktifkan.');
+  };
+
+  const handleDelete = (product) => {
+    if (!window.confirm('Hapus produk LPNU ini?')) return;
+    try {
+      db.deleteLpnuProduct(product.id);
+      loadProducts();
+      showToast('Produk LPNU dihapus.');
+    } catch (error) {
+      showToast(error.message, 'error');
+    }
+  };
+
+  return (
+    <div className="space-y-6 md:space-y-8 animate-fade-in">
+      <header className="flex flex-col sm:flex-row justify-between sm:items-end gap-4 px-1 md:px-0">
+        <div>
+          <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Produk LPNU</h1>
+          <p className="text-sm text-slate-500 mt-1.5">Kelola harga modal, harga jual, supplier, dan stok produk LPNU.</p>
+        </div>
+        <Button onClick={() => { setFormData(createFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto bg-blue-600 hover:bg-blue-700"><Plus size={20} /> Tambah Produk LPNU</Button>
+      </header>
+
+      <Card className="p-0 border-0 md:border shadow-sm overflow-hidden bg-transparent md:bg-white dark:bg-transparent md:dark:bg-[#111828]">
+        <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0 pb-4 md:pb-0">
+          <table className="w-full text-left text-sm whitespace-nowrap bg-white dark:bg-[#111828] rounded-2xl md:rounded-none border border-slate-200 dark:border-slate-800 md:border-0 shadow-sm md:shadow-none overflow-hidden">
+            <thead className="bg-slate-50 dark:bg-[#0a0f1c] border-b border-slate-200 dark:border-slate-800"><tr><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Produk</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Kategori</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Satuan</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Modal</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Jual</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Stok</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Status</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Aksi</th></tr></thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
+              {products.map(product => {
+                const stockStatus = getLpnuProductStockStatus(product);
+                return (
+                  <tr key={product.id} className={`${stockStatus === 'empty' || !product.isActive ? 'bg-slate-50/70 dark:bg-slate-800/10' : ''} hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors`}>
+                    <td className="p-4"><p className="font-extrabold text-slate-900 dark:text-slate-100">{product.name}</p><p className="text-xs font-semibold text-slate-500 mt-1">{product.supplier || '-'}</p></td>
+                    <td className="p-4 text-slate-600 dark:text-slate-300 font-semibold">{product.category || '-'}</td>
+                    <td className="p-4 text-slate-600 dark:text-slate-300 font-semibold">{product.unit || '-'}</td>
+                    <td className="p-4 font-black text-slate-700 dark:text-slate-200">{formatRp(product.costPrice)}</td>
+                    <td className="p-4 font-black text-blue-600 dark:text-blue-400">{formatRp(product.sellingPrice)}</td>
+                    <td className="p-4 font-black"><span className={stockStatus === 'empty' ? 'text-red-600 dark:text-red-400' : ''}>{product.stock}</span>{stockStatus === 'empty' && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 uppercase align-middle">Habis</span>}{stockStatus === 'critical' && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 uppercase align-middle">Kritis</span>}</td>
+                    <td className="p-4"><span className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider rounded-lg ${product.isActive ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>{product.isActive ? 'Aktif' : 'Nonaktif'}</span></td>
+                    <td className="p-4 text-right"><div className="flex flex-wrap justify-end gap-2"><button onClick={() => { setFormData(createFormData(product)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-blue-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button><button onClick={() => handleActiveChange(product)} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 ${product.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{product.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button><button onClick={() => handleDelete(product)} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Trash2 size={18} /></button></div></td>
+                  </tr>
+                );
+              })}
+              {products.length === 0 && <tr><td colSpan="8" className="p-8 text-center text-slate-500">Belum ada produk LPNU.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {isModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">
+          <Card className="w-full max-w-md shadow-2xl rounded-b-none md:rounded-2xl max-h-[90dvh] overflow-y-auto animate-fade-in-up">
+            <div className="flex justify-between items-center mb-6 sticky top-0 bg-white dark:bg-[#111828] z-10 pt-2 pb-2"><h2 className="text-2xl font-extrabold tracking-tight">{formData.id ? 'Edit Produk LPNU' : 'Tambah Produk LPNU'}</h2><button onClick={() => setIsModalOpen(false)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full"><X size={22} /></button></div>
+            <form onSubmit={handleSave} className="space-y-5 pb-6">
+              <Input label="Nama Produk" value={formData.name} onChange={e => setFormData({ ...formData, name: e.target.value })} required />
+              <div className="grid grid-cols-2 gap-4"><Input label="Kategori" value={formData.category} onChange={e => setFormData({ ...formData, category: e.target.value })} /><Input label="Satuan" value={formData.unit} onChange={e => setFormData({ ...formData, unit: e.target.value })} /></div>
+              <div className="grid grid-cols-2 gap-4"><Input label="Harga Modal" type="number" min="0" value={formData.costPrice} onChange={e => setFormData({ ...formData, costPrice: e.target.value })} required /><Input label="Harga Jual" type="number" min="0" value={formData.sellingPrice} onChange={e => setFormData({ ...formData, sellingPrice: e.target.value })} required /></div>
+              <div className="grid grid-cols-2 gap-4"><Input label="Stok" type="number" min="0" value={formData.stock} onChange={e => setFormData({ ...formData, stock: e.target.value })} required /><Input label="Stok Minimum" type="number" min="0" value={formData.minStock} onChange={e => setFormData({ ...formData, minStock: e.target.value })} required /></div>
+              <Input label="Supplier/Mitra" value={formData.supplier} onChange={e => setFormData({ ...formData, supplier: e.target.value })} />
+              <div className="flex items-center gap-3 pt-3 pb-3 bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-100 dark:border-slate-800"><input type="checkbox" checked={formData.isActive} onChange={e => setFormData({ ...formData, isActive: e.target.checked })} id="lpnuIsActive" className="w-6 h-6 rounded border-slate-300 text-blue-600 focus:ring-blue-500" /><label htmlFor="lpnuIsActive" className="text-sm font-bold cursor-pointer select-none">Produk Aktif</label></div>
+              <div className="flex gap-3 pt-4"><Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button><Button type="submit" className="flex-1 bg-blue-600 hover:bg-blue-700">Simpan</Button></div>
+            </form>
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const LpnuSalesView = ({ showToast }) => {
+  const { user } = useContext(AppContext);
+  const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
+  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
+  const [cartItems, setCartItems] = useState([]);
+  const selectedProduct = products.find(product => product.id === form.productId);
+  const totals = calculateLpnuTotals(cartItems, form.biayaOperasional);
+
+  const handleQtyChange = (value) => {
+    const digitsOnly = value.replace(/\D/g, '');
+    setForm(prev => ({ ...prev, qty: digitsOnly ? String(Number(digitsOnly)) : '' }));
+  };
+
+  const handleAddToCart = () => {
+    if (!selectedProduct) return showToast('Pilih produk LPNU terlebih dahulu.', 'error');
+    const selectedQty = Number(form.qty || 0);
+    if (selectedQty < 1) return showToast('Jumlah harus lebih dari 0.', 'error');
+
+    const existingItem = cartItems.find(item => item.productId === selectedProduct.id);
+    const nextQty = (existingItem?.qty || 0) + selectedQty;
+    if (nextQty > selectedProduct.stock) return showToast('Stok tidak mencukupi.', 'error');
+
+    const costPriceSnapshot = Number(selectedProduct.costPrice || 0);
+    const sellingPriceSnapshot = Number(selectedProduct.sellingPrice || 0);
+    setCartItems(prev => existingItem
+      ? prev.map(item => item.productId === selectedProduct.id ? { ...item, qty: nextQty, subtotalModal: costPriceSnapshot * nextQty, subtotalJual: sellingPriceSnapshot * nextQty, margin: (sellingPriceSnapshot - costPriceSnapshot) * nextQty } : item)
+      : [...prev, { productId: selectedProduct.id, productNameSnapshot: selectedProduct.name, categorySnapshot: selectedProduct.category || '-', unitSnapshot: selectedProduct.unit || '-', costPriceSnapshot, sellingPriceSnapshot, qty: selectedQty, subtotalModal: costPriceSnapshot * selectedQty, subtotalJual: sellingPriceSnapshot * selectedQty, margin: (sellingPriceSnapshot - costPriceSnapshot) * selectedQty }]);
+    setForm(prev => ({ ...prev, productId: '', qty: 0 }));
+  };
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    try {
+      const tx = db.addLpnuTransaction({ ...form, items: cartItems, petugasId: user.id, namaPetugasSnapshot: user.name });
+      setProducts(sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
+      setCartItems([]);
+      setForm({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
+      showToast(`Transaksi LPNU tersimpan: ${tx.transactionNumber}`);
+    } catch (error) {
+      showToast(error.message, 'error');
+    }
+  };
+
+  return (
+    <div className="space-y-6 md:space-y-8 animate-fade-in max-w-4xl mx-auto pt-2 md:pt-4">
+      <header className="text-center px-1 md:px-0"><h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Penjualan LPNU</h1><p className="text-slate-500 mt-1.5 text-sm md:text-base">Catat transaksi produk kolaborasi dengan margin dan biaya operasional.</p></header>
+      <Card className="shadow-lg border-slate-200/60 p-5 md:p-8">
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-5"><div className="space-y-2"><label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">Petugas Penjual</label><div className="w-full bg-slate-50 dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-3 min-h-[48px] text-base md:text-sm text-slate-900 dark:text-slate-100 font-bold flex items-center">{user.name}</div></div><Input label="Nama Pembeli (Opsional)" placeholder="Hamba Allah" value={form.buyerName} onChange={e => setForm({ ...form, buyerName: e.target.value })} /></div>
+          <div className="p-4 md:p-6 bg-slate-50 dark:bg-[#0a0f1c] rounded-2xl border border-slate-200 dark:border-slate-800 space-y-5"><Select label="Pilih Produk LPNU" value={form.productId} onChange={e => setForm({ ...form, productId: e.target.value })} options={products.map(product => ({ value: product.id, label: `${product.name} - ${product.unit || '-'} - stok ${product.stock}` }))} /><div className="grid grid-cols-2 gap-4 md:gap-5"><Input label="Jumlah (Qty)" type="number" min="0" value={form.qty} onChange={e => handleQtyChange(e.target.value)} required /><Button type="button" onClick={handleAddToCart} className="self-end h-[48px] bg-blue-600 hover:bg-blue-700">Tambah</Button></div></div>
+          <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-2xl"><table className="w-full text-left text-sm whitespace-nowrap"><thead className="bg-slate-50 dark:bg-[#111828] text-slate-500 dark:text-slate-400"><tr><th className="p-3 font-bold">Produk</th><th className="p-3 font-bold">Satuan</th><th className="p-3 font-bold">Qty</th><th className="p-3 font-bold">Harga Modal</th><th className="p-3 font-bold">Harga Jual</th><th className="p-3 font-bold">Subtotal Jual</th><th className="p-3 font-bold">Margin</th><th className="p-3 font-bold text-right">Aksi</th></tr></thead><tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">{cartItems.map(item => (<tr key={item.productId}><td className="p-3 font-bold text-slate-900 dark:text-slate-100">{item.productNameSnapshot}</td><td className="p-3 font-semibold text-slate-600 dark:text-slate-300">{item.unitSnapshot}</td><td className="p-3 font-black">{item.qty}</td><td className="p-3 font-semibold">{formatRp(item.costPriceSnapshot)}</td><td className="p-3 font-semibold text-blue-600 dark:text-blue-400">{formatRp(item.sellingPriceSnapshot)}</td><td className="p-3 font-black text-blue-600 dark:text-blue-400">{formatRp(item.subtotalJual)}</td><td className="p-3 font-black text-emerald-600 dark:text-emerald-400">{formatRp(item.margin)}</td><td className="p-3 text-right"><button type="button" onClick={() => setCartItems(prev => prev.filter(cartItem => cartItem.productId !== item.productId))} className="px-3 py-2 text-xs font-bold text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-500/10 rounded-lg">Hapus</button></td></tr>))}{cartItems.length === 0 && <tr><td colSpan="8" className="p-5 text-center text-slate-500 font-medium">Keranjang LPNU masih kosong.</td></tr>}</tbody></table></div>
+          <Input label="Biaya Operasional" type="number" min="0" value={form.biayaOperasional} onChange={e => setForm({ ...form, biayaOperasional: e.target.value })} />
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">{[['Total Modal', totals.totalModal], ['Total Jual', totals.totalJual], ['Laba Kotor', totals.labaKotor], ['Biaya Operasional', totals.biayaOperasional], ['Laba Bersih', totals.labaBersih]].map(([label, value]) => (<div key={label} className="rounded-2xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-4"><p className="text-[10px] font-black uppercase text-slate-500">{label}</p><p className="text-lg font-black mt-1 text-slate-900 dark:text-white">{formatRp(value)}</p></div>))}</div>
+          <Button type="submit" disabled={cartItems.length === 0} className="w-full py-4 text-base bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400">Simpan Transaksi LPNU</Button>
+        </form>
+      </Card>
+    </div>
+  );
+};
+
+const LpnuPlaceholderView = ({ title, description, children }) => (
+  <div className="space-y-6 animate-fade-in max-w-3xl mx-auto pt-2 md:pt-4">
+    <header className="text-center px-1 md:px-0"><h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">{title}</h1><p className="text-slate-500 mt-1.5 text-sm md:text-base">{description}</p></header>
+    <Card className="p-8 text-center border-dashed"><p className="font-extrabold text-slate-900 dark:text-white">Tahap fondasi sudah disiapkan.</p><p className="text-sm text-slate-500 mt-2">Fitur detail akan diaktifkan setelah data dan alur LPNU final.</p>{children}</Card>
+  </div>
+);
 
 // ============================================================================
 // 6. CORE MODULES (Cleaned & Validated)
@@ -3623,7 +4072,12 @@ export default function App() {
         return;
       }
 
-      if (currentView !== 'dashboard') {
+      if (currentView.startsWith('lpnu-') && currentView !== 'lpnu-dashboard') {
+        setView('lpnu-dashboard');
+        return;
+      }
+
+      if (!currentView.startsWith('lpnu-') && currentView !== 'dashboard') {
         setView('dashboard');
       }
     };
@@ -3765,8 +4219,8 @@ export default function App() {
           ) : <>
             {view === 'welcome' && <WelcomeView onNext={() => setView('login')} />}
             {view === 'login' && <LoginView onLoginSuccess={handleLoginSuccess} showToast={showToast} />}
-            {view === 'modules' && <ModuleSelectionView onSelectModule={setView} showToast={showToast} />}
-            {['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'].includes(view) && user && (
+            {view === 'modules' && <ModuleSelectionView onSelectModule={setView} />}
+            {STIKERNISASI_VIEWS.includes(view) && user && (
               <DashboardLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
                 {view === 'dashboard' && <DashboardOverview setView={setView} />}
                 {view === 'products' && <ProductsView showToast={showToast} />}
@@ -3777,6 +4231,18 @@ export default function App() {
                 {view === 'spreadsheet' && <SpreadsheetView showToast={showToast} />}
                 {view === 'invoice' && <InvoiceView invoiceData={invoiceData} setView={setView} backView={invoiceBackView} />}
               </DashboardLayout>
+            )}
+            {LPNU_VIEWS.includes(view) && user && (
+              <LpnuLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
+                {view === 'lpnu-dashboard' && <LpnuOverviewView setView={setView} />}
+                {view === 'lpnu-sales' && <LpnuSalesView showToast={showToast} />}
+                {view === 'lpnu-products' && <LpnuProductsView showToast={showToast} />}
+                {view === 'lpnu-stock' && <LpnuProductsView showToast={showToast} />}
+                {view === 'lpnu-reports' && <LpnuPlaceholderView title="Laporan LPNU" description="Laporan khusus produk LPNU akan terpisah dari laporan Stikernisasi." />}
+                {view === 'lpnu-finance' && <LpnuPlaceholderView title="Keuangan LPNU" description="Keuangan LPNU memakai modal, omzet, margin, biaya, dan laba bersih." />}
+                {view === 'lpnu-spreadsheet' && <LpnuPlaceholderView title="Spreadsheet LPNU" description="Sync Spreadsheet LPNU akan menggunakan tab khusus LPNU."><p className="mt-4 text-sm font-bold text-blue-600 dark:text-blue-400">Tab rencana: LPNU - Dashboard, LPNU - Transaksi Detail, LPNU - Rekap Transaksi, LPNU - Keuangan, LPNU - Produk Stok.</p></LpnuPlaceholderView>}
+                {view === 'lpnu-settings' && <LpnuPlaceholderView title="Pengaturan LPNU" description="Pengaturan LPNU akan disiapkan setelah rumus pembagian hasil final." />}
+              </LpnuLayout>
             )}
           </>}
 

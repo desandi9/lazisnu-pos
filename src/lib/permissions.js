@@ -26,6 +26,8 @@ export const canDeleteProduct = (user) => canManageProducts(user);
 export const canAccessView = (user, view) => {
   if (!user) return false;
 
+  if (String(view || '').startsWith('lpnu-')) return isOwner(user) || isAdmin(user);
+
   if (view === 'users') return canManageUsers(user);
   if (view === 'profit-settings') return canManageProfitSharing(user);
   if (view === 'sales') return canCreateTransaction(user);
