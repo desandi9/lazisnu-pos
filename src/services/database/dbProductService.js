@@ -107,7 +107,12 @@ export async function setProductActiveInDb(productId, isActive) {
 }
 
 export async function updateProductStockInDb(productId, stock) {
-  return updateProductInDb(productId, { stock });
+  const nextStock = Math.max(0, Number(stock || 0));
+
+  return updateProductInDb(productId, {
+    stock: nextStock,
+    ...(nextStock <= 0 ? { isActive: false } : {})
+  });
 }
 
 export async function checkProductHasTransactions(product) {

@@ -480,6 +480,10 @@ class DatabaseService {
 
     items.forEach(item => {
       products[item.productIndex].stock -= item.qty;
+      if (products[item.productIndex].stock <= 0) {
+        products[item.productIndex].stock = 0;
+        products[item.productIndex].isActive = false;
+      }
     });
     this._set('products', products);
 
@@ -1293,7 +1297,7 @@ const DashboardLayout = ({ children, currentView, setView, user, onLogout }) => 
 // 6. CORE MODULES (Cleaned & Validated)
 // ============================================================================
 
-const DashboardOverview = () => {
+const DashboardOverview = ({ setView }) => {
   const [stats] = useState(() => {
     const transactions = db.getTransactions();
     const products = db.getProducts();
@@ -1358,6 +1362,47 @@ const DashboardOverview = () => {
           </div>
         </Card>
       </div>
+
+      <section className="space-y-4">
+        <div className="px-1 md:px-0">
+          <h2 className="text-xl md:text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">Akses Cepat</h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Buka menu utama yang paling sering dipakai.</p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-5">
+          <button
+            type="button"
+            onClick={() => setView('sales')}
+            className="group text-left rounded-2xl bg-white dark:bg-[#111828] border border-slate-200 dark:border-slate-800 p-5 md:p-6 shadow-sm hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.99]"
+          >
+            <div className="flex items-center gap-4">
+              <div className="w-[52px] h-[52px] rounded-2xl bg-emerald-50 dark:bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center border border-emerald-100 dark:border-emerald-500/20 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-500/20 transition-colors">
+                <ShoppingCart size={24} />
+              </div>
+              <div>
+                <h3 className="text-lg font-black text-slate-900 dark:text-white tracking-tight">Input Penjualan</h3>
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mt-1">Catat transaksi baru</p>
+              </div>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setView('products')}
+            className="group text-left rounded-2xl bg-white dark:bg-[#111828] border border-slate-200 dark:border-slate-800 p-5 md:p-6 shadow-sm hover:shadow-lg hover:-translate-y-0.5 transition-all active:scale-[0.99]"
+          >
+            <div className="flex items-center gap-4">
+              <div className="w-[52px] h-[52px] rounded-2xl bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 flex items-center justify-center border border-slate-100 dark:border-slate-700 group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors">
+                <Package size={24} />
+              </div>
+              <div>
+                <h3 className="text-lg font-black text-slate-900 dark:text-white tracking-tight">Data Produk</h3>
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mt-1">Kelola stok dan harga</p>
+              </div>
+            </div>
+          </button>
+        </div>
+      </section>
     </div>
   );
 };
@@ -1815,6 +1860,8 @@ const ProductsView = ({ showToast }) => {
     if (Number.isNaN(minStock) || minStock < 0) errors.push('Stok minimum tidak boleh negatif');
     if (!status.isValid) errors.push('Status tidak valid');
 
+    const normalizedStock = Number.isNaN(stock) ? 0 : stock;
+
     return {
       rowNumber: index + 2,
       product: {
@@ -1822,9 +1869,9 @@ const ProductsView = ({ showToast }) => {
         category,
         size,
         price: Number.isNaN(price) ? 0 : price,
-        stock: Number.isNaN(stock) ? 0 : stock,
+        stock: normalizedStock,
         minStock: Number.isNaN(minStock) ? 0 : minStock,
-        isActive: status.value
+        isActive: normalizedStock > 0 ? status.value : false
       },
       errors,
       isValid: errors.length === 0
@@ -1949,7 +1996,7 @@ const ProductsView = ({ showToast }) => {
       price: Number(formData.price),
       stock: Number(formData.stock),
       minStock: Number(formData.minStock),
-      isActive: formData.isActive
+      isActive: Number(formData.stock) > 0 ? formData.isActive : false
     };
 
     setIsSubmittingProduct(true);
@@ -2340,7 +2387,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
           const latestProduct = latestProducts.find(product => product.id === productId);
           if (!latestProduct) return { success: false };
 
-          return updateProductStockInDb(latestProduct.id, latestProduct.stock - totalQty);
+          return updateProductStockInDb(latestProduct.id, Math.max(0, latestProduct.stock - totalQty));
         }));
 
         if (stockResults.some(result => !result.success)) throw new Error('Gagal menyimpan transaksi ke database.');
@@ -3547,7 +3594,7 @@ export default function App() {
             {view === 'modules' && <ModuleSelectionView onSelectModule={setView} showToast={showToast} />}
             {['dashboard', 'products', 'sales', 'reports', 'spreadsheet', 'invoice', 'users', 'profit-settings'].includes(view) && user && (
               <DashboardLayout currentView={view} setView={setView} user={user} onLogout={handleLogout}>
-                {view === 'dashboard' && <DashboardOverview />}
+                {view === 'dashboard' && <DashboardOverview setView={setView} />}
                 {view === 'products' && <ProductsView showToast={showToast} />}
                 {view === 'users' && user.role === 'owner' && <UsersView showToast={showToast} />}
                 {view === 'sales' && <SalesView showToast={showToast} setView={setView} setInvoiceData={setInvoiceData} setInvoiceBackView={setInvoiceBackView} />}
