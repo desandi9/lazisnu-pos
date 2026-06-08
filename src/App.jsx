@@ -21,8 +21,14 @@ import {
   isLpnuProductDbId,
   setLpnuProductActiveInDb,
   syncLpnuProductsCacheFromDb,
-  updateLpnuProductInDb
+  updateLpnuProductInDb,
+  updateLpnuProductStockInDb
 } from './services/database/dbLpnuProductService';
+import {
+  checkLpnuTransactionExistsByNumber,
+  createLpnuTransactionInDb,
+  syncLpnuTransactionsCacheFromDb
+} from './services/database/dbLpnuTransactionService';
 import {
   createUserInDb,
   deleteUserFromDb,
@@ -244,7 +250,7 @@ const calculateLpnuTotals = (items, biayaOperasional = 0) => {
     totalJual,
     labaKotor: totalJual - supplierAmount,
     biayaOperasional: biaya,
-    labaBersih: sisaPengelola - biaya,
+    labaBersih: totalJual - supplierAmount - biaya,
     supplierAmount,
     lpnuAmount,
     pcnuAmount,
@@ -254,6 +260,8 @@ const calculateLpnuTotals = (items, biayaOperasional = 0) => {
     sisaPengelola
   };
 };
+
+const createLpnuTransactionNumber = (suffix = '') => `LPNU-TX-${Date.now()}${suffix}`;
 
 const normalizeUser = (user, index = 0) => {
   const now = new Date().toISOString();
@@ -798,6 +806,8 @@ class DatabaseService {
 
   getLpnuProducts() { return this._get('lpnuProducts'); }
 
+  setLpnuProducts(products) { this._set('lpnuProducts', products); }
+
   saveLpnuProduct(product) {
     const products = this.getLpnuProducts();
     const existingIndex = products.findIndex(item => item.id === product.id);
@@ -833,6 +843,8 @@ class DatabaseService {
   }
 
   getLpnuTransactions() { return this._get('lpnuTransactions'); }
+
+  setLpnuTransactions(transactions) { this._set('lpnuTransactions', transactions); }
 
   addLpnuTransaction(txData) {
     const products = this.getLpnuProducts();
@@ -1671,17 +1683,22 @@ const sortLpnuProducts = (products) => products.slice().sort((a, b) => {
 
 const LpnuOverviewView = ({ setView }) => {
   const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts()));
-  const transactions = db.getLpnuTransactions();
+  const [transactions, setTransactions] = useState(() => db.getLpnuTransactions());
 
   useEffect(() => {
     let isMounted = true;
 
     queueMicrotask(async () => {
-      const result = await syncLpnuProductsCacheFromDb();
-      const sourceProducts = result.success ? result.data : db.getLpnuProducts();
+      const [productResult, transactionResult] = await Promise.all([
+        syncLpnuProductsCacheFromDb(),
+        syncLpnuTransactionsCacheFromDb()
+      ]);
+      const sourceProducts = productResult.success ? productResult.data : db.getLpnuProducts();
+      const sourceTransactions = transactionResult.success ? transactionResult.data : db.getLpnuTransactions();
 
       if (!isMounted) return;
       setProducts(sortLpnuProducts(sourceProducts));
+      setTransactions(sourceTransactions);
     });
 
     return () => {
@@ -1693,7 +1710,7 @@ const LpnuOverviewView = ({ setView }) => {
     omzet: transactions.reduce((sum, tx) => sum + Number(tx.totalJual || 0), 0),
     totalTransactions: transactions.length,
     totalQty: transactions.reduce((sum, tx) => sum + Number(tx.totalQty || tx.qty || 0), 0),
-    labaBersih: transactions.reduce((sum, tx) => sum + Number(tx.sisaPengelola || 0), 0),
+    labaBersih: transactions.reduce((sum, tx) => sum + Number(tx.labaBersih ?? tx.sisaPengelola ?? 0), 0),
     activeProducts: products.filter(product => product.isActive && Number(product.stock || 0) > 0).length,
     criticalStock: products.filter(product => product.stock > 0 && product.stock <= product.minStock).length,
     emptyStock: products.filter(product => Number(product.stock || 0) <= 0).length
@@ -2004,6 +2021,10 @@ const LpnuSalesView = ({ showToast }) => {
   const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
   const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
   const [cartItems, setCartItems] = useState([]);
+  const [transactions, setTransactions] = useState(() => db.getLpnuTransactions());
+  const [transactionSource, setTransactionSource] = useState('Lokal');
+  const [isSubmittingTransaction, setIsSubmittingTransaction] = useState(false);
+  const [selectedReceipt, setSelectedReceipt] = useState(null);
   const [showPembagianDetails, setShowPembagianDetails] = useState(false);
   const selectedProduct = products.find(product => product.id === form.productId);
   const totals = calculateLpnuTotals(cartItems, form.biayaOperasional);
@@ -2012,11 +2033,17 @@ const LpnuSalesView = ({ showToast }) => {
     let isMounted = true;
 
     queueMicrotask(async () => {
-      const result = await syncLpnuProductsCacheFromDb();
-      const sourceProducts = result.success ? result.data : db.getLpnuProducts();
+      const [productResult, transactionResult] = await Promise.all([
+        syncLpnuProductsCacheFromDb(),
+        syncLpnuTransactionsCacheFromDb()
+      ]);
+      const sourceProducts = productResult.success ? productResult.data : db.getLpnuProducts();
+      const sourceTransactions = transactionResult.success ? transactionResult.data : db.getLpnuTransactions();
 
       if (!isMounted) return;
       setProducts(sortLpnuProducts(sourceProducts.filter(product => product.isActive && product.stock > 0)));
+      setTransactions(sourceTransactions);
+      setTransactionSource(transactionResult.success ? 'Database' : 'Lokal');
     });
 
     return () => {
@@ -2087,17 +2114,123 @@ const LpnuSalesView = ({ showToast }) => {
     setForm(prev => ({ ...prev, productId: '', qty: 0 }));
   };
 
-  const handleSubmit = (event) => {
+  const buildTransactionPayload = async () => {
+    let transactionNumber = createLpnuTransactionNumber();
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existsResult = await checkLpnuTransactionExistsByNumber(transactionNumber);
+      if (!existsResult.success || !existsResult.data) break;
+      transactionNumber = createLpnuTransactionNumber(`-${attempt + 1}`);
+    }
+
+    return {
+      id: transactionNumber,
+      transactionNumber,
+      date: new Date().toISOString(),
+      buyerName: form.buyerName || 'Hamba Allah',
+      petugasId: user.id,
+      namaPetugasSnapshot: user.name,
+      items: cartItems.map(item => ({
+        ...item,
+        productId: item.productId,
+        productNameSnapshot: item.productNameSnapshot || '-',
+        categorySnapshot: item.categorySnapshot || 'LPNU',
+        unitSnapshot: item.unitSnapshot || '-',
+        costPriceSnapshot: Number(item.costPriceSnapshot || 0),
+        sellingPriceSnapshot: Number(item.sellingPriceSnapshot || 0),
+        qty: Number(item.qty || 0),
+        subtotalModal: Number(item.subtotalModal || 0),
+        subtotalJual: Number(item.subtotalJual || 0),
+        margin: Number(item.margin || 0)
+      })),
+      ...totals,
+      paymentMethod: form.paymentMethod || 'Tunai',
+      notes: form.notes || '',
+      syncStatus: 'pending',
+      syncedAt: null
+    };
+  };
+
+  const validateLpnuStockForTransaction = (sourceProducts) => {
+    const requestedQtyByProduct = cartItems.reduce((acc, item) => {
+      acc[item.productId] = (acc[item.productId] || 0) + Number(item.qty || 0);
+      return acc;
+    }, {});
+
+    return Object.entries(requestedQtyByProduct).map(([productId, qty]) => {
+      const product = sourceProducts.find(item => item.id === productId);
+      if (!product) throw new Error('Produk LPNU tidak ditemukan di database. Muat ulang produk lalu coba lagi.');
+      if (!isLpnuProductDbId(product.id)) throw new Error('Produk LPNU belum tersimpan di database. Simpan produk ke Supabase terlebih dahulu.');
+      if (Number(product.stock || 0) < qty) throw new Error(`Stok ${product.name} tidak mencukupi.`);
+
+      return { product, qty, nextStock: Number(product.stock || 0) - qty };
+    });
+  };
+
+  const refreshLpnuSalesData = async () => {
+    const [productResult, transactionResult] = await Promise.all([
+      syncLpnuProductsCacheFromDb(),
+      syncLpnuTransactionsCacheFromDb()
+    ]);
+    const sourceProducts = productResult.success ? productResult.data : db.getLpnuProducts();
+    const sourceTransactions = transactionResult.success ? transactionResult.data : db.getLpnuTransactions();
+
+    setProducts(sortLpnuProducts(sourceProducts.filter(product => product.isActive && product.stock > 0)));
+    setTransactions(sourceTransactions);
+    setTransactionSource(transactionResult.success ? 'Database' : 'Lokal');
+
+    return { sourceProducts, sourceTransactions };
+  };
+
+  const handleSubmit = async (event) => {
     event.preventDefault();
+    if (isSubmittingTransaction) return;
+    if (cartItems.length === 0) return showToast('Keranjang transaksi masih kosong.', 'error');
+
+    setIsSubmittingTransaction(true);
     try {
-      const tx = db.addLpnuTransaction({ ...form, items: cartItems, petugasId: user.id, namaPetugasSnapshot: user.name });
-      setProducts(sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
+      const health = await checkDatabaseConnection();
+      let tx;
+
+      if (health.status === 'connected') {
+        const productResult = await syncLpnuProductsCacheFromDb();
+        if (!productResult.success) throw new Error('Gagal menyimpan transaksi LPNU ke database.');
+
+        const stockUpdates = validateLpnuStockForTransaction(productResult.data);
+        const transactionPayload = await buildTransactionPayload();
+        const result = await createLpnuTransactionInDb(transactionPayload);
+        if (!result.success) {
+          console.error('LPNU transaction insert failed', { error: result.error, transactionPayload });
+          throw new Error('Gagal menyimpan transaksi LPNU ke database.');
+        }
+
+        for (const stockUpdate of stockUpdates) {
+          const stockResult = await updateLpnuProductStockInDb(stockUpdate.product.id, stockUpdate.nextStock);
+          if (!stockResult.success) {
+            console.error('LPNU product stock update failed after transaction', { error: stockResult.error, stockUpdate });
+            throw new Error('Gagal menyimpan transaksi LPNU ke database.');
+          }
+        }
+
+        const refreshed = await refreshLpnuSalesData();
+        tx = refreshed.sourceTransactions.find(item => item.id === result.data.id) || result.data;
+      } else {
+        tx = db.addLpnuTransaction({ ...form, items: cartItems, petugasId: user.id, namaPetugasSnapshot: user.name });
+        setProducts(sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
+        setTransactions(db.getLpnuTransactions());
+        setTransactionSource('Lokal');
+        if (health.status !== 'not_configured') showToast('Database tidak tersedia, transaksi LPNU disimpan lokal.', 'error');
+      }
+
       setCartItems([]);
       setShowPembagianDetails(false);
       setForm({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
+      setSelectedReceipt(tx);
       showToast(`Transaksi LPNU tersimpan: ${tx.transactionNumber}`);
     } catch (error) {
       showToast(error.message, 'error');
+    } finally {
+      setIsSubmittingTransaction(false);
     }
   };
 
@@ -2125,9 +2258,45 @@ const LpnuSalesView = ({ showToast }) => {
               </div>
             )}
           </div>
-          <Button type="submit" disabled={cartItems.length === 0} className="w-full py-4 text-base bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400">Simpan Transaksi LPNU</Button>
+          <Button type="submit" disabled={cartItems.length === 0} isLoading={isSubmittingTransaction} className="w-full py-4 text-base bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400">Simpan Transaksi LPNU</Button>
         </form>
       </Card>
+
+      <Card className="p-0 overflow-hidden border-slate-200/70 shadow-sm">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-5 border-b border-slate-100 dark:border-slate-800">
+          <div>
+            <h2 className="text-lg font-extrabold text-slate-900 dark:text-white">Riwayat Transaksi LPNU</h2>
+            <p className="text-xs font-bold text-blue-600 dark:text-blue-400 mt-1">Sumber: {transactionSource}</p>
+          </div>
+          <Button type="button" variant="secondary" onClick={refreshLpnuSalesData} className="w-full sm:w-auto"><RefreshCcw size={16} /> Refresh</Button>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm whitespace-nowrap">
+            <thead className="bg-slate-50 dark:bg-[#0a0f1c] text-slate-500 dark:text-slate-400"><tr><th className="p-3 font-bold">No Transaksi</th><th className="p-3 font-bold">Tanggal</th><th className="p-3 font-bold">Pembeli</th><th className="p-3 font-bold">Qty</th><th className="p-3 font-bold">Total</th><th className="p-3 font-bold text-right">Struk</th></tr></thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
+              {transactions.slice(0, 8).map(tx => (<tr key={tx.id || tx.transactionNumber}><td className="p-3 font-black text-slate-900 dark:text-white">{tx.transactionNumber}</td><td className="p-3 font-semibold text-slate-600 dark:text-slate-300">{formatDateTimeId(tx.date)}</td><td className="p-3 font-semibold text-slate-600 dark:text-slate-300">{tx.buyerName || 'Hamba Allah'}</td><td className="p-3 font-black">{tx.totalQty || tx.items?.reduce((sum, item) => sum + Number(item.qty || 0), 0) || 0}</td><td className="p-3 font-black text-blue-600 dark:text-blue-400">{formatRp(tx.totalJual || 0)}</td><td className="p-3 text-right"><button type="button" onClick={() => setSelectedReceipt(tx)} className="px-3 py-2 text-xs font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 rounded-lg">Lihat Struk LPNU</button></td></tr>))}
+              {transactions.length === 0 && <tr><td colSpan="6" className="p-5 text-center text-slate-500 font-medium">Belum ada transaksi LPNU.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {selectedReceipt && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">
+          <Card className="w-full max-w-md shadow-2xl rounded-b-none md:rounded-2xl max-h-[90dvh] overflow-y-auto animate-fade-in-up">
+            <div className="flex justify-between items-center mb-5 sticky top-0 bg-white dark:bg-[#111828] z-10 pt-2 pb-2"><h2 className="text-xl font-extrabold tracking-tight">Struk LPNU</h2><button onClick={() => setSelectedReceipt(null)} className="w-10 h-10 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full"><X size={20} /></button></div>
+            <div className="space-y-4 text-sm">
+              <div className="text-center border-b border-dashed border-slate-200 dark:border-slate-700 pb-4"><p className="text-lg font-black text-slate-900 dark:text-white">LAZISNU x LPNU Garut</p><p className="text-xs font-semibold text-slate-500 mt-1">Struk Transaksi</p></div>
+              <div className="grid grid-cols-2 gap-2 text-xs"><p className="text-slate-500 font-bold">No Transaksi</p><p className="text-right font-black text-slate-900 dark:text-white">{selectedReceipt.transactionNumber}</p><p className="text-slate-500 font-bold">Tanggal</p><p className="text-right font-semibold">{formatDateTimeId(selectedReceipt.date)}</p><p className="text-slate-500 font-bold">Pembeli</p><p className="text-right font-semibold">{selectedReceipt.buyerName || 'Hamba Allah'}</p><p className="text-slate-500 font-bold">Petugas</p><p className="text-right font-semibold">{selectedReceipt.namaPetugasSnapshot || '-'}</p></div>
+              <div className="border-y border-dashed border-slate-200 dark:border-slate-700 divide-y divide-slate-100 dark:divide-slate-800">
+                {(selectedReceipt.items || []).map(item => (<div key={item.id || item.productId} className="py-3"><div className="flex justify-between gap-3"><p className="font-black text-slate-900 dark:text-white">{item.productNameSnapshot}</p><p className="font-black text-blue-600 dark:text-blue-400">{formatRp(item.subtotalJual)}</p></div><p className="text-xs text-slate-500 mt-1">{item.qty} x {formatRp(item.sellingPriceSnapshot)} {item.unitSnapshot ? `/ ${item.unitSnapshot}` : ''}</p></div>))}
+              </div>
+              <div className="space-y-2"><div className="flex justify-between font-bold"><span>Total Jual</span><span>{formatRp(selectedReceipt.totalJual || 0)}</span></div>{Number(selectedReceipt.biayaOperasional || 0) > 0 && <div className="flex justify-between text-xs font-semibold text-slate-500"><span>Biaya Operasional</span><span>{formatRp(selectedReceipt.biayaOperasional)}</span></div>}</div>
+              <Button type="button" className="w-full bg-blue-600 hover:bg-blue-700" onClick={() => window.print()}><Printer size={18} /> Cetak</Button>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 };
