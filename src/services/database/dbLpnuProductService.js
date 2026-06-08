@@ -8,7 +8,30 @@ const notConfiguredResult = {
   error: 'Supabase belum dikonfigurasi.'
 };
 
-const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i.test(String(value || ''));
+export const isLpnuProductDbId = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i.test(String(value || ''));
+
+const isMissingPeciFinanceColumnError = (error) => /supplier_share|lpnu_share|pcnu_share|lazisnu_share|lazisnu_infaq_percent/i.test(error?.message || '');
+
+const omitPeciFinanceColumns = (row) => {
+  const nextRow = { ...row };
+  delete nextRow.supplier_share;
+  delete nextRow.lpnu_share;
+  delete nextRow.pcnu_share;
+  delete nextRow.lazisnu_share;
+  delete nextRow.lazisnu_infaq_percent;
+
+  return nextRow;
+};
+
+const logLpnuProductDbError = (action, error, payload) => {
+  console.error(`LPNU product ${action} failed`, {
+    message: error?.message || null,
+    details: error?.details || null,
+    hint: error?.hint || null,
+    code: error?.code || null,
+    payload
+  });
+};
 
 export const mapLpnuProductFromDb = (row) => ({
   id: row.id,
@@ -17,6 +40,11 @@ export const mapLpnuProductFromDb = (row) => ({
   unit: row.unit || '',
   costPrice: Number(row.cost_price || 0),
   sellingPrice: Number(row.selling_price || 0),
+  supplierShare: Number(row.supplier_share ?? row.cost_price ?? 0),
+  lpnuShare: Number(row.lpnu_share ?? 2500),
+  pcnuShare: Number(row.pcnu_share ?? 2500),
+  lazisnuShare: Number(row.lazisnu_share ?? 2500),
+  lazisnuInfaqPercent: Number(row.lazisnu_infaq_percent ?? 50),
   stock: Number(row.stock || 0),
   minStock: Number(row.min_stock || 0),
   supplier: row.supplier || '',
@@ -34,12 +62,15 @@ export const mapLpnuProductToDb = (product) => {
     unit: product.unit || null,
     cost_price: Number(product.costPrice ?? product.cost_price ?? 0),
     selling_price: Number(product.sellingPrice ?? product.selling_price ?? 0),
+    supplier_share: Number(product.supplierShare ?? product.supplier_share ?? product.costPrice ?? product.cost_price ?? 0),
+    lpnu_share: Number(product.lpnuShare ?? product.lpnu_share ?? 2500),
+    pcnu_share: Number(product.pcnuShare ?? product.pcnu_share ?? 2500),
+    lazisnu_share: Number(product.lazisnuShare ?? product.lazisnu_share ?? 2500),
+    lazisnu_infaq_percent: Number(product.lazisnuInfaqPercent ?? product.lazisnu_infaq_percent ?? 50),
     stock,
     min_stock: Number(product.minStock ?? product.min_stock ?? 0),
     supplier: product.supplier || null,
-    is_active: stock > 0 ? (product.isActive ?? product.is_active ?? true) : false,
-    created_at: product.createdAt || new Date().toISOString(),
-    updated_at: product.updatedAt || new Date().toISOString()
+    is_active: stock > 0 ? (product.isActive ?? product.is_active ?? true) : false
   };
 };
 
@@ -61,8 +92,16 @@ export async function createLpnuProductInDb(product) {
 
   try {
     const row = mapLpnuProductToDb(product);
-    const { data, error } = await supabase.from('lpnu_products').insert(row).select('*').single();
-    if (error) throw error;
+    let payload = { ...row };
+    let { data, error } = await supabase.from('lpnu_products').insert(payload).select('*').single();
+    if (error && isMissingPeciFinanceColumnError(error)) {
+      payload = omitPeciFinanceColumns(row);
+      ({ data, error } = await supabase.from('lpnu_products').insert(payload).select('*').single());
+    }
+    if (error) {
+      logLpnuProductDbError('insert', error, payload);
+      throw error;
+    }
 
     return { success: true, data: mapLpnuProductFromDb(data) };
   } catch (error) {
@@ -70,27 +109,39 @@ export async function createLpnuProductInDb(product) {
   }
 }
 
-export async function updateLpnuProductInDb(productId, payload) {
+export async function updateLpnuProductInDb(productId, updates) {
   if (!isSupabaseConfigured()) return notConfiguredResult;
-  if (!isUuid(productId)) return { success: false, status: 'error', error: 'ID produk LPNU database tidak valid.' };
+  if (!isLpnuProductDbId(productId)) return { success: false, status: 'error', error: 'ID produk LPNU database tidak valid.' };
 
   try {
     const row = {
-      ...(payload.name !== undefined ? { name: payload.name } : {}),
-      ...(payload.category !== undefined ? { category: payload.category || null } : {}),
-      ...(payload.unit !== undefined ? { unit: payload.unit || null } : {}),
-      ...(payload.costPrice !== undefined || payload.cost_price !== undefined ? { cost_price: Number(payload.costPrice ?? payload.cost_price ?? 0) } : {}),
-      ...(payload.sellingPrice !== undefined || payload.selling_price !== undefined ? { selling_price: Number(payload.sellingPrice ?? payload.selling_price ?? 0) } : {}),
-      ...(payload.stock !== undefined ? { stock: Math.max(0, Number(payload.stock || 0)) } : {}),
-      ...(payload.minStock !== undefined || payload.min_stock !== undefined ? { min_stock: Number(payload.minStock ?? payload.min_stock ?? 0) } : {}),
-      ...(payload.supplier !== undefined ? { supplier: payload.supplier || null } : {}),
-      ...(payload.isActive !== undefined || payload.is_active !== undefined ? { is_active: payload.isActive ?? payload.is_active } : {}),
-      updated_at: new Date().toISOString()
+      ...(updates.name !== undefined ? { name: updates.name } : {}),
+      ...(updates.category !== undefined ? { category: updates.category || null } : {}),
+      ...(updates.unit !== undefined ? { unit: updates.unit || null } : {}),
+      ...(updates.costPrice !== undefined || updates.cost_price !== undefined ? { cost_price: Number(updates.costPrice ?? updates.cost_price ?? 0) } : {}),
+      ...(updates.sellingPrice !== undefined || updates.selling_price !== undefined ? { selling_price: Number(updates.sellingPrice ?? updates.selling_price ?? 0) } : {}),
+      ...(updates.supplierShare !== undefined || updates.supplier_share !== undefined ? { supplier_share: Number(updates.supplierShare ?? updates.supplier_share ?? 0) } : {}),
+      ...(updates.lpnuShare !== undefined || updates.lpnu_share !== undefined ? { lpnu_share: Number(updates.lpnuShare ?? updates.lpnu_share ?? 0) } : {}),
+      ...(updates.pcnuShare !== undefined || updates.pcnu_share !== undefined ? { pcnu_share: Number(updates.pcnuShare ?? updates.pcnu_share ?? 0) } : {}),
+      ...(updates.lazisnuShare !== undefined || updates.lazisnu_share !== undefined ? { lazisnu_share: Number(updates.lazisnuShare ?? updates.lazisnu_share ?? 0) } : {}),
+      ...(updates.lazisnuInfaqPercent !== undefined || updates.lazisnu_infaq_percent !== undefined ? { lazisnu_infaq_percent: Number(updates.lazisnuInfaqPercent ?? updates.lazisnu_infaq_percent ?? 50) } : {}),
+      ...(updates.stock !== undefined ? { stock: Math.max(0, Number(updates.stock || 0)) } : {}),
+      ...(updates.minStock !== undefined || updates.min_stock !== undefined ? { min_stock: Number(updates.minStock ?? updates.min_stock ?? 0) } : {}),
+      ...(updates.supplier !== undefined ? { supplier: updates.supplier || null } : {}),
+      ...(updates.isActive !== undefined || updates.is_active !== undefined ? { is_active: updates.isActive ?? updates.is_active } : {})
     };
     if (row.stock !== undefined && row.stock <= 0) row.is_active = false;
 
-    const { data, error } = await supabase.from('lpnu_products').update(row).eq('id', productId).select('*').single();
-    if (error) throw error;
+    let payload = { ...row };
+    let { data, error } = await supabase.from('lpnu_products').update(payload).eq('id', productId).select('*').single();
+    if (error && isMissingPeciFinanceColumnError(error)) {
+      payload = omitPeciFinanceColumns(row);
+      ({ data, error } = await supabase.from('lpnu_products').update(payload).eq('id', productId).select('*').single());
+    }
+    if (error) {
+      logLpnuProductDbError('update', error, payload);
+      throw error;
+    }
 
     return { success: true, data: mapLpnuProductFromDb(data) };
   } catch (error) {
@@ -100,7 +151,7 @@ export async function updateLpnuProductInDb(productId, payload) {
 
 export async function deleteLpnuProductFromDb(productId) {
   if (!isSupabaseConfigured()) return notConfiguredResult;
-  if (!isUuid(productId)) return { success: false, status: 'error', error: 'ID produk LPNU database tidak valid.' };
+  if (!isLpnuProductDbId(productId)) return { success: false, status: 'error', error: 'ID produk LPNU database tidak valid.' };
 
   try {
     const { data, error } = await supabase.from('lpnu_products').delete().eq('id', productId).select('id');
@@ -129,7 +180,7 @@ export async function checkLpnuProductHasTransactions(product) {
   if (!isSupabaseConfigured()) return notConfiguredResult;
 
   try {
-    if (!isUuid(product?.id)) return { success: true, data: false };
+    if (!isLpnuProductDbId(product?.id)) return { success: true, data: false };
 
     const { data, error } = await supabase
       .from('lpnu_transaction_items')

@@ -18,6 +18,7 @@ import {
   checkLpnuProductHasTransactions,
   createLpnuProductInDb,
   deleteLpnuProductFromDb,
+  isLpnuProductDbId,
   setLpnuProductActiveInDb,
   syncLpnuProductsCacheFromDb,
   updateLpnuProductInDb
@@ -206,18 +207,51 @@ const calculateProfitSharing = (total, settings) => ({
   pengelolaAmount: Math.round(total * settings.pengelolaPercent / 100)
 });
 
+const DEFAULT_LPNU_PECI_SHARING = {
+  supplierShare: 40000,
+  lpnuShare: 2500,
+  pcnuShare: 2500,
+  lazisnuShare: 2500,
+  lazisnuInfaqPercent: 50
+};
+
+const normalizeLpnuProductFinance = (product = {}) => ({
+  ...product,
+  costPrice: Number(product.costPrice ?? product.supplierShare ?? DEFAULT_LPNU_PECI_SHARING.supplierShare),
+  sellingPrice: Number(product.sellingPrice ?? 0),
+  supplierShare: Number(product.supplierShare ?? product.costPrice ?? DEFAULT_LPNU_PECI_SHARING.supplierShare),
+  lpnuShare: Number(product.lpnuShare ?? DEFAULT_LPNU_PECI_SHARING.lpnuShare),
+  pcnuShare: Number(product.pcnuShare ?? DEFAULT_LPNU_PECI_SHARING.pcnuShare),
+  lazisnuShare: Number(product.lazisnuShare ?? DEFAULT_LPNU_PECI_SHARING.lazisnuShare),
+  lazisnuInfaqPercent: Number(product.lazisnuInfaqPercent ?? DEFAULT_LPNU_PECI_SHARING.lazisnuInfaqPercent)
+});
+
 const calculateLpnuTotals = (items, biayaOperasional = 0) => {
-  const totalModal = items.reduce((sum, item) => sum + Number(item.subtotalModal || 0), 0);
+  const totalQty = items.reduce((sum, item) => sum + Number(item.qty || 0), 0);
   const totalJual = items.reduce((sum, item) => sum + Number(item.subtotalJual || 0), 0);
-  const labaKotor = totalJual - totalModal;
+  const supplierAmount = items.reduce((sum, item) => sum + Number(item.supplierAmount || 0), 0);
+  const lpnuAmount = items.reduce((sum, item) => sum + Number(item.lpnuAmount || 0), 0);
+  const pcnuAmount = items.reduce((sum, item) => sum + Number(item.pcnuAmount || 0), 0);
+  const lazisnuAmount = items.reduce((sum, item) => sum + Number(item.lazisnuAmount || 0), 0);
+  const lazisnuInfaqAmount = items.reduce((sum, item) => sum + Number(item.lazisnuInfaqAmount || 0), 0);
+  const totalPembagian = supplierAmount + lpnuAmount + pcnuAmount + lazisnuAmount;
+  const sisaPengelola = totalJual - totalPembagian;
   const biaya = Number(biayaOperasional || 0);
 
   return {
-    totalModal,
+    totalQty,
+    totalModal: supplierAmount,
     totalJual,
-    labaKotor,
+    labaKotor: totalJual - supplierAmount,
     biayaOperasional: biaya,
-    labaBersih: labaKotor - biaya
+    labaBersih: sisaPengelola - biaya,
+    supplierAmount,
+    lpnuAmount,
+    pcnuAmount,
+    lazisnuAmount,
+    lazisnuInfaqAmount,
+    totalPembagian,
+    sisaPengelola
   };
 };
 
@@ -253,6 +287,47 @@ const SEED_DATA = {
   transactions: []
 };
 
+const DEFAULT_LPNU_PRODUCTS = [
+  {
+    id: 'LPNU-P-001',
+    name: 'Peci',
+    category: 'Peci',
+    unit: 'pcs',
+    costPrice: 40000,
+    sellingPrice: 50000,
+    supplierShare: 40000,
+    lpnuShare: 2500,
+    pcnuShare: 2500,
+    lazisnuShare: 2500,
+    lazisnuInfaqPercent: 50,
+    stock: 100,
+    minStock: 10,
+    supplier: 'H. Rajab',
+    isActive: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  },
+  {
+    id: 'LPNU-P-002',
+    name: 'Peci untuk Dijual Lagi',
+    category: 'Peci',
+    unit: 'pcs',
+    costPrice: 40000,
+    sellingPrice: 48000,
+    supplierShare: 40000,
+    lpnuShare: 2500,
+    pcnuShare: 2500,
+    lazisnuShare: 2500,
+    lazisnuInfaqPercent: 50,
+    stock: 100,
+    minStock: 10,
+    supplier: 'H. Rajab',
+    isActive: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  }
+];
+
 class DatabaseService {
   constructor() {
     this.prefix = 'lazisnu_core_';
@@ -264,6 +339,19 @@ class DatabaseService {
     if (!localStorage.getItem(this.prefix + 'products')) localStorage.setItem(this.prefix + 'products', JSON.stringify(SEED_DATA.products));
     if (!localStorage.getItem(this.prefix + 'transactions')) localStorage.setItem(this.prefix + 'transactions', JSON.stringify(SEED_DATA.transactions));
     if (!localStorage.getItem(this.prefix + 'profitSharingSettings')) localStorage.setItem(this.prefix + 'profitSharingSettings', JSON.stringify(DEFAULT_PROFIT_SHARING_SETTINGS));
+    this.initLpnuProducts();
+  }
+
+  initLpnuProducts() {
+    const products = this.getLpnuProducts();
+    const mergedProducts = [...products];
+
+    DEFAULT_LPNU_PRODUCTS.forEach(defaultProduct => {
+      const exists = mergedProducts.some(product => String(product.name || '').trim().toLowerCase() === defaultProduct.name.toLowerCase());
+      if (!exists) mergedProducts.push(defaultProduct);
+    });
+
+    this._set('lpnuProducts', mergedProducts.map(normalizeLpnuProductFinance));
   }
 
   initUsers() {
@@ -715,19 +803,17 @@ class DatabaseService {
     const existingIndex = products.findIndex(item => item.id === product.id);
     const now = new Date().toISOString();
     const stock = Math.max(0, Number(product.stock || 0));
-    const nextProduct = {
+    const nextProduct = normalizeLpnuProductFinance({
       ...product,
       name: String(product.name || '').trim(),
       category: String(product.category || '').trim(),
       unit: String(product.unit || '').trim(),
       supplier: String(product.supplier || '').trim(),
-      costPrice: Number(product.costPrice || 0),
-      sellingPrice: Number(product.sellingPrice || 0),
       stock,
       minStock: Number(product.minStock || 0),
       isActive: stock > 0 ? Boolean(product.isActive) : false,
       updatedAt: now
-    };
+    });
 
     if (existingIndex >= 0) {
       products[existingIndex] = { ...products[existingIndex], ...nextProduct };
@@ -762,10 +848,22 @@ class DatabaseService {
       if (qty < 1) throw new Error('Qty tidak valid.');
       if (product.stock < qty) throw new Error('Stok tidak mencukupi.');
 
-      const costPriceSnapshot = Number(product.costPrice || 0);
-      const sellingPriceSnapshot = Number(product.sellingPrice || 0);
-      const subtotalModal = costPriceSnapshot * qty;
+      const financeProduct = normalizeLpnuProductFinance(product);
+      const costPriceSnapshot = Number(financeProduct.costPrice || 0);
+      const sellingPriceSnapshot = Number(financeProduct.sellingPrice || 0);
+      const supplierShareSnapshot = Number(financeProduct.supplierShare || 0);
+      const lpnuShareSnapshot = Number(financeProduct.lpnuShare || 0);
+      const pcnuShareSnapshot = Number(financeProduct.pcnuShare || 0);
+      const lazisnuShareSnapshot = Number(financeProduct.lazisnuShare || 0);
+      const lazisnuInfaqPercentSnapshot = Number(financeProduct.lazisnuInfaqPercent || 0);
+      const subtotalModal = supplierShareSnapshot * qty;
       const subtotalJual = sellingPriceSnapshot * qty;
+      const supplierAmount = supplierShareSnapshot * qty;
+      const lpnuAmount = lpnuShareSnapshot * qty;
+      const pcnuAmount = pcnuShareSnapshot * qty;
+      const lazisnuAmount = lazisnuShareSnapshot * qty;
+      const lazisnuInfaqAmount = Math.round(lazisnuAmount * lazisnuInfaqPercentSnapshot / 100);
+      const totalPembagian = supplierAmount + lpnuAmount + pcnuAmount + lazisnuAmount;
 
       return {
         productIndex,
@@ -775,10 +873,22 @@ class DatabaseService {
         unitSnapshot: product.unit || '-',
         costPriceSnapshot,
         sellingPriceSnapshot,
+        supplierShareSnapshot,
+        lpnuShareSnapshot,
+        pcnuShareSnapshot,
+        lazisnuShareSnapshot,
+        lazisnuInfaqPercentSnapshot,
         qty,
         subtotalModal,
         subtotalJual,
-        margin: subtotalJual - subtotalModal
+        margin: subtotalJual - subtotalModal,
+        supplierAmount,
+        lpnuAmount,
+        pcnuAmount,
+        lazisnuAmount,
+        lazisnuInfaqAmount,
+        totalPembagian,
+        sisaPengelola: subtotalJual - totalPembagian
       };
     });
 
@@ -1580,14 +1690,13 @@ const LpnuOverviewView = ({ setView }) => {
   }, []);
 
   const stats = {
-    totalProducts: products.length,
-    totalStock: products.reduce((sum, product) => sum + Number(product.stock || 0), 0),
     omzet: transactions.reduce((sum, tx) => sum + Number(tx.totalJual || 0), 0),
-    labaKotor: transactions.reduce((sum, tx) => sum + Number(tx.labaKotor || 0), 0),
-    labaBersih: transactions.reduce((sum, tx) => sum + Number(tx.labaBersih || 0), 0),
+    totalTransactions: transactions.length,
+    totalQty: transactions.reduce((sum, tx) => sum + Number(tx.totalQty || tx.qty || 0), 0),
+    labaBersih: transactions.reduce((sum, tx) => sum + Number(tx.sisaPengelola || 0), 0),
+    activeProducts: products.filter(product => product.isActive && Number(product.stock || 0) > 0).length,
     criticalStock: products.filter(product => product.stock > 0 && product.stock <= product.minStock).length,
-    emptyStock: products.filter(product => Number(product.stock || 0) <= 0).length,
-    inactiveProducts: products.filter(product => !product.isActive).length
+    emptyStock: products.filter(product => Number(product.stock || 0) <= 0).length
   };
 
   return (
@@ -1599,14 +1708,13 @@ const LpnuOverviewView = ({ setView }) => {
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         {[
-          ['Total Produk LPNU', stats.totalProducts],
-          ['Total Stok', stats.totalStock],
-          ['Omzet LPNU', formatRp(stats.omzet)],
-          ['Laba Kotor', formatRp(stats.labaKotor)],
-          ['Laba Bersih', formatRp(stats.labaBersih)],
+          ['Total Penjualan', formatRp(stats.omzet)],
+          ['Total Transaksi', stats.totalTransactions],
+          ['Total Qty Terjual', stats.totalQty],
+          ['Produk Aktif', stats.activeProducts],
           ['Stok Kritis', stats.criticalStock],
-          ['Produk Habis', stats.emptyStock],
-          ['Produk Nonaktif', stats.inactiveProducts]
+          ['Stok Habis', stats.emptyStock],
+          ['Laba Bersih', formatRp(stats.labaBersih)]
         ].map(([label, value]) => (
           <Card key={label} className="p-4 border-slate-200/70 shadow-sm">
             <p className="text-[11px] font-black uppercase tracking-wide text-slate-500">{label}</p>
@@ -1642,10 +1750,15 @@ const LpnuProductsView = ({ showToast }) => {
   const createFormData = (product = {}) => ({
     id: product.id || null,
     name: product.name || '',
-    category: product.category || '',
+    category: product.category || 'LPNU',
     unit: product.unit || 'pcs',
     costPrice: product.costPrice ?? '',
     sellingPrice: product.sellingPrice ?? '',
+    supplierShare: product.supplierShare ?? DEFAULT_LPNU_PECI_SHARING.supplierShare,
+    lpnuShare: product.lpnuShare ?? DEFAULT_LPNU_PECI_SHARING.lpnuShare,
+    pcnuShare: product.pcnuShare ?? DEFAULT_LPNU_PECI_SHARING.pcnuShare,
+    lazisnuShare: product.lazisnuShare ?? DEFAULT_LPNU_PECI_SHARING.lazisnuShare,
+    lazisnuInfaqPercent: product.lazisnuInfaqPercent ?? DEFAULT_LPNU_PECI_SHARING.lazisnuInfaqPercent,
     stock: product.stock ?? '',
     minStock: product.minStock ?? '5',
     supplier: product.supplier || '',
@@ -1702,16 +1815,26 @@ const LpnuProductsView = ({ showToast }) => {
     if (Number(formData.sellingPrice) <= 0) return showToast('Harga jual harus lebih dari 0.', 'error');
     if (Number(formData.stock) < 0) return showToast('Stok tidak boleh negatif.', 'error');
     if (Number(formData.minStock) < 0) return showToast('Stok minimum tidak boleh negatif.', 'error');
+    if ([formData.supplierShare, formData.lpnuShare, formData.pcnuShare, formData.lazisnuShare].some(value => Number(value) < 0)) return showToast('Semua nominal pembagian harus 0 atau lebih.', 'error');
+    if (Number(formData.lazisnuInfaqPercent) < 0 || Number(formData.lazisnuInfaqPercent) > 100) return showToast('Persen infaq LAZISNU harus 0 sampai 100.', 'error');
     if (Number(formData.sellingPrice) < Number(formData.costPrice) && !window.confirm('Harga jual lebih kecil dari harga modal. Tetap simpan produk ini?')) return;
+
+    const totalPembagianProduk = Number(formData.supplierShare || 0) + Number(formData.lpnuShare || 0) + Number(formData.pcnuShare || 0) + Number(formData.lazisnuShare || 0);
+    if (Number(formData.sellingPrice || 0) < totalPembagianProduk && !window.confirm('Harga jual lebih kecil dari total pembagian. Tetap simpan produk ini?')) return;
 
     const productPayload = {
       ...formData,
       name: formData.name.trim(),
-      category: formData.category.trim(),
+      category: 'LPNU',
       unit: formData.unit.trim(),
       supplier: formData.supplier.trim(),
       costPrice: Number(formData.costPrice || 0),
       sellingPrice: Number(formData.sellingPrice || 0),
+      supplierShare: Number(formData.supplierShare || 0),
+      lpnuShare: Number(formData.lpnuShare || 0),
+      pcnuShare: Number(formData.pcnuShare || 0),
+      lazisnuShare: Number(formData.lazisnuShare || 0),
+      lazisnuInfaqPercent: Number(formData.lazisnuInfaqPercent || 0),
       stock: Number(formData.stock || 0),
       minStock: Number(formData.minStock || 0),
       isActive: Number(formData.stock || 0) > 0 ? formData.isActive : false
@@ -1722,11 +1845,11 @@ const LpnuProductsView = ({ showToast }) => {
       const health = await checkDatabaseConnection();
 
       if (health.status === 'connected') {
-        const result = formData.id
+        const result = isLpnuProductDbId(formData.id)
           ? await updateLpnuProductInDb(formData.id, productPayload)
           : await createLpnuProductInDb(productPayload);
 
-        if (!result.success) throw new Error('Gagal menyimpan produk LPNU ke database.');
+        if (!result.success) throw new Error(`Gagal menyimpan produk LPNU: ${result.error || 'Database menolak perubahan.'}`);
 
         await refreshProducts();
       } else {
@@ -1753,8 +1876,10 @@ const LpnuProductsView = ({ showToast }) => {
       const health = await checkDatabaseConnection();
 
       if (health.status === 'connected') {
-        const result = await setLpnuProductActiveInDb(product.id, nextActive);
-        if (!result.success) throw new Error('Gagal menyimpan produk LPNU ke database.');
+        const result = isLpnuProductDbId(product.id)
+          ? await setLpnuProductActiveInDb(product.id, nextActive)
+          : await createLpnuProductInDb({ ...product, isActive: nextActive });
+        if (!result.success) throw new Error(`Gagal menyimpan produk LPNU: ${result.error || 'Database menolak perubahan.'}`);
 
         await refreshProducts();
       } else {
@@ -1776,12 +1901,19 @@ const LpnuProductsView = ({ showToast }) => {
       const health = await checkDatabaseConnection();
 
       if (health.status === 'connected') {
+        if (!isLpnuProductDbId(product.id)) {
+          db.deleteLpnuProduct(product.id);
+          await refreshProducts();
+          showToast('Produk LPNU lokal dihapus.');
+          return;
+        }
+
         const txResult = await checkLpnuProductHasTransactions(product);
         if (!txResult.success) throw new Error(txResult.error || 'Gagal mengecek transaksi produk LPNU.');
         if (txResult.data) throw new Error('Produk LPNU ini sudah memiliki riwayat transaksi. Nonaktifkan saja agar laporan tetap aman.');
 
         const result = await deleteLpnuProductFromDb(product.id);
-        if (!result.success) throw new Error('Gagal menghapus produk LPNU ke database.');
+        if (!result.success) throw new Error(`Gagal menghapus produk LPNU: ${result.error || 'Database menolak perubahan.'}`);
 
         await refreshProducts();
       } else {
@@ -1795,6 +1927,9 @@ const LpnuProductsView = ({ showToast }) => {
       showToast(error.message, 'error');
     }
   };
+
+  const formTotalPembagian = Number(formData.supplierShare || 0) + Number(formData.lpnuShare || 0) + Number(formData.pcnuShare || 0) + Number(formData.lazisnuShare || 0);
+  const formSisaPengelola = Number(formData.sellingPrice || 0) - formTotalPembagian;
 
   return (
     <div className="space-y-6 md:space-y-8 animate-fade-in">
@@ -1810,18 +1945,18 @@ const LpnuProductsView = ({ showToast }) => {
       <Card className="p-0 border-0 md:border shadow-sm overflow-hidden bg-transparent md:bg-white dark:bg-transparent md:dark:bg-[#111828]">
         <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0 pb-4 md:pb-0">
           <table className="w-full text-left text-sm whitespace-nowrap bg-white dark:bg-[#111828] rounded-2xl md:rounded-none border border-slate-200 dark:border-slate-800 md:border-0 shadow-sm md:shadow-none overflow-hidden">
-            <thead className="bg-slate-50 dark:bg-[#0a0f1c] border-b border-slate-200 dark:border-slate-800"><tr><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Produk</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Kategori</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Satuan</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Modal</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Jual</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Stok</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Status</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Aksi</th></tr></thead>
+            <thead className="bg-slate-50 dark:bg-[#0a0f1c] border-b border-slate-200 dark:border-slate-800"><tr><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Produk</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Satuan</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Modal</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Jual</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Stok</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Supplier/Mitra</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400">Status</th><th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Aksi</th></tr></thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
               {products.map(product => {
                 const stockStatus = getLpnuProductStockStatus(product);
                 return (
                   <tr key={product.id} className={`${stockStatus === 'empty' || !product.isActive ? 'bg-slate-50/70 dark:bg-slate-800/10' : ''} hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors`}>
-                    <td className="p-4"><p className="font-extrabold text-slate-900 dark:text-slate-100">{product.name}</p><p className="text-xs font-semibold text-slate-500 mt-1">{product.supplier || '-'}</p></td>
-                    <td className="p-4 text-slate-600 dark:text-slate-300 font-semibold">{product.category || '-'}</td>
+                    <td className="p-4 font-extrabold text-slate-900 dark:text-slate-100">{product.name}</td>
                     <td className="p-4 text-slate-600 dark:text-slate-300 font-semibold">{product.unit || '-'}</td>
                     <td className="p-4 font-black text-slate-700 dark:text-slate-200">{formatRp(product.costPrice)}</td>
                     <td className="p-4 font-black text-blue-600 dark:text-blue-400">{formatRp(product.sellingPrice)}</td>
                     <td className="p-4 font-black"><span className={stockStatus === 'empty' ? 'text-red-600 dark:text-red-400' : ''}>{product.stock}</span>{stockStatus === 'empty' && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 uppercase align-middle">Habis</span>}{stockStatus === 'critical' && <span className="ml-2 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 uppercase align-middle">Kritis</span>}</td>
+                    <td className="p-4 text-slate-600 dark:text-slate-300 font-semibold">{product.supplier || '-'}</td>
                     <td className="p-4"><span className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider rounded-lg ${product.isActive ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>{product.isActive ? 'Aktif' : 'Nonaktif'}</span></td>
                     <td className="p-4 text-right"><div className="flex flex-wrap justify-end gap-2"><button onClick={() => { setFormData(createFormData(product)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-blue-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button><button onClick={() => handleActiveChange(product)} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 ${product.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{product.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button><button onClick={() => handleDelete(product)} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Trash2 size={18} /></button></div></td>
                   </tr>
@@ -1839,10 +1974,21 @@ const LpnuProductsView = ({ showToast }) => {
             <div className="flex justify-between items-center mb-6 sticky top-0 bg-white dark:bg-[#111828] z-10 pt-2 pb-2"><h2 className="text-2xl font-extrabold tracking-tight">{formData.id ? 'Edit Produk LPNU' : 'Tambah Produk LPNU'}</h2><button onClick={() => setIsModalOpen(false)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full"><X size={22} /></button></div>
             <form onSubmit={handleSave} className="space-y-5 pb-6">
               <Input label="Nama Produk" value={formData.name} onChange={e => setFormData({ ...formData, name: e.target.value })} required />
-              <div className="grid grid-cols-2 gap-4"><Input label="Kategori" value={formData.category} onChange={e => setFormData({ ...formData, category: e.target.value })} /><Input label="Satuan" value={formData.unit} onChange={e => setFormData({ ...formData, unit: e.target.value })} /></div>
+              <Input label="Satuan" value={formData.unit} onChange={e => setFormData({ ...formData, unit: e.target.value })} />
               <div className="grid grid-cols-2 gap-4"><Input label="Harga Modal" type="number" min="0" value={formData.costPrice} onChange={e => setFormData({ ...formData, costPrice: e.target.value })} required /><Input label="Harga Jual" type="number" min="0" value={formData.sellingPrice} onChange={e => setFormData({ ...formData, sellingPrice: e.target.value })} required /></div>
               <div className="grid grid-cols-2 gap-4"><Input label="Stok" type="number" min="0" value={formData.stock} onChange={e => setFormData({ ...formData, stock: e.target.value })} required /><Input label="Stok Minimum" type="number" min="0" value={formData.minStock} onChange={e => setFormData({ ...formData, minStock: e.target.value })} required /></div>
               <Input label="Supplier/Mitra" value={formData.supplier} onChange={e => setFormData({ ...formData, supplier: e.target.value })} />
+              <div className="space-y-4 rounded-2xl border border-blue-100 dark:border-blue-500/20 bg-blue-50/60 dark:bg-blue-500/10 p-4">
+                <div>
+                  <h3 className="text-sm font-black text-slate-900 dark:text-white">Skema Pembagian Peci</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Nominal pembagian dihitung per pcs.</p>
+                </div>
+                <div className="grid grid-cols-2 gap-4"><Input label="Supplier / H. Rajab" type="number" min="0" value={formData.supplierShare} onChange={e => setFormData({ ...formData, supplierShare: e.target.value, costPrice: e.target.value })} /><Input label="LPNU / Kang Memet" type="number" min="0" value={formData.lpnuShare} onChange={e => setFormData({ ...formData, lpnuShare: e.target.value })} /></div>
+                <div className="grid grid-cols-2 gap-4"><Input label="Bagian PCNU" type="number" min="0" value={formData.pcnuShare} onChange={e => setFormData({ ...formData, pcnuShare: e.target.value })} /><Input label="Bagian LAZISNU" type="number" min="0" value={formData.lazisnuShare} onChange={e => setFormData({ ...formData, lazisnuShare: e.target.value })} /></div>
+                <Input label="Persen Infaq dari Bagian LAZISNU" type="number" min="0" max="100" value={formData.lazisnuInfaqPercent} onChange={e => setFormData({ ...formData, lazisnuInfaqPercent: e.target.value })} />
+                <div className="grid grid-cols-2 gap-3 text-sm"><div className="rounded-xl bg-white dark:bg-[#111828] border border-slate-100 dark:border-slate-800 p-3"><p className="text-xs font-bold text-slate-500 uppercase">Total Pembagian</p><p className="font-black text-slate-900 dark:text-white mt-1">{formatRp(formTotalPembagian)}</p></div><div className={`rounded-xl border p-3 ${formSisaPengelola < 0 ? 'bg-red-50 border-red-100 dark:bg-red-500/10 dark:border-red-500/20' : 'bg-white border-slate-100 dark:bg-[#111828] dark:border-slate-800'}`}><p className="text-xs font-bold text-slate-500 uppercase">Sisa/Pengelola</p><p className={`font-black mt-1 ${formSisaPengelola < 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-900 dark:text-white'}`}>{formatRp(formSisaPengelola)}</p></div></div>
+                {formSisaPengelola < 0 && <p className="text-xs font-bold text-red-600 dark:text-red-400">Harga jual lebih kecil dari total pembagian.</p>}
+              </div>
               <div className="flex items-center gap-3 pt-3 pb-3 bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-100 dark:border-slate-800"><input type="checkbox" checked={formData.isActive} onChange={e => setFormData({ ...formData, isActive: e.target.checked })} id="lpnuIsActive" className="w-6 h-6 rounded border-slate-300 text-blue-600 focus:ring-blue-500" /><label htmlFor="lpnuIsActive" className="text-sm font-bold cursor-pointer select-none">Produk Aktif</label></div>
               <div className="flex gap-3 pt-4"><Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button><Button type="submit" isLoading={isSubmittingProduct} className="flex-1 bg-blue-600 hover:bg-blue-700">Simpan</Button></div>
             </form>
@@ -1858,6 +2004,7 @@ const LpnuSalesView = ({ showToast }) => {
   const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
   const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
   const [cartItems, setCartItems] = useState([]);
+  const [showPembagianDetails, setShowPembagianDetails] = useState(false);
   const selectedProduct = products.find(product => product.id === form.productId);
   const totals = calculateLpnuTotals(cartItems, form.biayaOperasional);
 
@@ -1891,11 +2038,52 @@ const LpnuSalesView = ({ showToast }) => {
     const nextQty = (existingItem?.qty || 0) + selectedQty;
     if (nextQty > selectedProduct.stock) return showToast('Stok tidak mencukupi.', 'error');
 
-    const costPriceSnapshot = Number(selectedProduct.costPrice || 0);
-    const sellingPriceSnapshot = Number(selectedProduct.sellingPrice || 0);
+    const financeProduct = normalizeLpnuProductFinance(selectedProduct);
+    const costPriceSnapshot = Number(financeProduct.costPrice || 0);
+    const sellingPriceSnapshot = Number(financeProduct.sellingPrice || 0);
+    const supplierShareSnapshot = Number(financeProduct.supplierShare || 0);
+    const lpnuShareSnapshot = Number(financeProduct.lpnuShare || 0);
+    const pcnuShareSnapshot = Number(financeProduct.pcnuShare || 0);
+    const lazisnuShareSnapshot = Number(financeProduct.lazisnuShare || 0);
+    const lazisnuInfaqPercentSnapshot = Number(financeProduct.lazisnuInfaqPercent || 0);
+    const buildCartItem = (qty) => {
+      const subtotalModal = supplierShareSnapshot * qty;
+      const subtotalJual = sellingPriceSnapshot * qty;
+      const supplierAmount = supplierShareSnapshot * qty;
+      const lpnuAmount = lpnuShareSnapshot * qty;
+      const pcnuAmount = pcnuShareSnapshot * qty;
+      const lazisnuAmount = lazisnuShareSnapshot * qty;
+      const lazisnuInfaqAmount = Math.round(lazisnuAmount * lazisnuInfaqPercentSnapshot / 100);
+      const totalPembagian = supplierAmount + lpnuAmount + pcnuAmount + lazisnuAmount;
+
+      return {
+        productId: selectedProduct.id,
+        productNameSnapshot: selectedProduct.name,
+        categorySnapshot: selectedProduct.category || '-',
+        unitSnapshot: selectedProduct.unit || '-',
+        costPriceSnapshot,
+        sellingPriceSnapshot,
+        supplierShareSnapshot,
+        lpnuShareSnapshot,
+        pcnuShareSnapshot,
+        lazisnuShareSnapshot,
+        lazisnuInfaqPercentSnapshot,
+        qty,
+        subtotalModal,
+        subtotalJual,
+        margin: subtotalJual - subtotalModal,
+        supplierAmount,
+        lpnuAmount,
+        pcnuAmount,
+        lazisnuAmount,
+        lazisnuInfaqAmount,
+        totalPembagian,
+        sisaPengelola: subtotalJual - totalPembagian
+      };
+    };
     setCartItems(prev => existingItem
-      ? prev.map(item => item.productId === selectedProduct.id ? { ...item, qty: nextQty, subtotalModal: costPriceSnapshot * nextQty, subtotalJual: sellingPriceSnapshot * nextQty, margin: (sellingPriceSnapshot - costPriceSnapshot) * nextQty } : item)
-      : [...prev, { productId: selectedProduct.id, productNameSnapshot: selectedProduct.name, categorySnapshot: selectedProduct.category || '-', unitSnapshot: selectedProduct.unit || '-', costPriceSnapshot, sellingPriceSnapshot, qty: selectedQty, subtotalModal: costPriceSnapshot * selectedQty, subtotalJual: sellingPriceSnapshot * selectedQty, margin: (sellingPriceSnapshot - costPriceSnapshot) * selectedQty }]);
+      ? prev.map(item => item.productId === selectedProduct.id ? buildCartItem(nextQty) : item)
+      : [...prev, buildCartItem(selectedQty)]);
     setForm(prev => ({ ...prev, productId: '', qty: 0 }));
   };
 
@@ -1905,6 +2093,7 @@ const LpnuSalesView = ({ showToast }) => {
       const tx = db.addLpnuTransaction({ ...form, items: cartItems, petugasId: user.id, namaPetugasSnapshot: user.name });
       setProducts(sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
       setCartItems([]);
+      setShowPembagianDetails(false);
       setForm({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
       showToast(`Transaksi LPNU tersimpan: ${tx.transactionNumber}`);
     } catch (error) {
@@ -1914,14 +2103,28 @@ const LpnuSalesView = ({ showToast }) => {
 
   return (
     <div className="space-y-6 md:space-y-8 animate-fade-in max-w-4xl mx-auto pt-2 md:pt-4">
-      <header className="text-center px-1 md:px-0"><h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Penjualan LPNU</h1><p className="text-slate-500 mt-1.5 text-sm md:text-base">Catat transaksi produk kolaborasi dengan margin dan biaya operasional.</p></header>
+      <header className="text-center px-1 md:px-0"><h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Penjualan LPNU</h1><p className="text-slate-500 mt-1.5 text-sm md:text-base">Catat transaksi produk LPNU dengan tampilan input yang ringkas.</p></header>
       <Card className="shadow-lg border-slate-200/60 p-5 md:p-8">
         <form onSubmit={handleSubmit} className="space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-5"><div className="space-y-2"><label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">Petugas Penjual</label><div className="w-full bg-slate-50 dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-3 min-h-[48px] text-base md:text-sm text-slate-900 dark:text-slate-100 font-bold flex items-center">{user.name}</div></div><Input label="Nama Pembeli (Opsional)" placeholder="Hamba Allah" value={form.buyerName} onChange={e => setForm({ ...form, buyerName: e.target.value })} /></div>
-          <div className="p-4 md:p-6 bg-slate-50 dark:bg-[#0a0f1c] rounded-2xl border border-slate-200 dark:border-slate-800 space-y-5"><Select label="Pilih Produk LPNU" value={form.productId} onChange={e => setForm({ ...form, productId: e.target.value })} options={products.map(product => ({ value: product.id, label: `${product.name} - ${product.unit || '-'} - stok ${product.stock}` }))} /><div className="grid grid-cols-2 gap-4 md:gap-5"><Input label="Jumlah (Qty)" type="number" min="0" value={form.qty} onChange={e => handleQtyChange(e.target.value)} required /><Button type="button" onClick={handleAddToCart} className="self-end h-[48px] bg-blue-600 hover:bg-blue-700">Tambah</Button></div></div>
-          <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-2xl"><table className="w-full text-left text-sm whitespace-nowrap"><thead className="bg-slate-50 dark:bg-[#111828] text-slate-500 dark:text-slate-400"><tr><th className="p-3 font-bold">Produk</th><th className="p-3 font-bold">Satuan</th><th className="p-3 font-bold">Qty</th><th className="p-3 font-bold">Harga Modal</th><th className="p-3 font-bold">Harga Jual</th><th className="p-3 font-bold">Subtotal Jual</th><th className="p-3 font-bold">Margin</th><th className="p-3 font-bold text-right">Aksi</th></tr></thead><tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">{cartItems.map(item => (<tr key={item.productId}><td className="p-3 font-bold text-slate-900 dark:text-slate-100">{item.productNameSnapshot}</td><td className="p-3 font-semibold text-slate-600 dark:text-slate-300">{item.unitSnapshot}</td><td className="p-3 font-black">{item.qty}</td><td className="p-3 font-semibold">{formatRp(item.costPriceSnapshot)}</td><td className="p-3 font-semibold text-blue-600 dark:text-blue-400">{formatRp(item.sellingPriceSnapshot)}</td><td className="p-3 font-black text-blue-600 dark:text-blue-400">{formatRp(item.subtotalJual)}</td><td className="p-3 font-black text-emerald-600 dark:text-emerald-400">{formatRp(item.margin)}</td><td className="p-3 text-right"><button type="button" onClick={() => setCartItems(prev => prev.filter(cartItem => cartItem.productId !== item.productId))} className="px-3 py-2 text-xs font-bold text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-500/10 rounded-lg">Hapus</button></td></tr>))}{cartItems.length === 0 && <tr><td colSpan="8" className="p-5 text-center text-slate-500 font-medium">Keranjang LPNU masih kosong.</td></tr>}</tbody></table></div>
-          <Input label="Biaya Operasional" type="number" min="0" value={form.biayaOperasional} onChange={e => setForm({ ...form, biayaOperasional: e.target.value })} />
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">{[['Total Modal', totals.totalModal], ['Total Jual', totals.totalJual], ['Laba Kotor', totals.labaKotor], ['Biaya Operasional', totals.biayaOperasional], ['Laba Bersih', totals.labaBersih]].map(([label, value]) => (<div key={label} className="rounded-2xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-4"><p className="text-[10px] font-black uppercase text-slate-500">{label}</p><p className="text-lg font-black mt-1 text-slate-900 dark:text-white">{formatRp(value)}</p></div>))}</div>
+          <div className="p-4 md:p-6 bg-slate-50 dark:bg-[#0a0f1c] rounded-2xl border border-slate-200 dark:border-slate-800 space-y-5"><Select label="Pilih Produk LPNU" value={form.productId} onChange={e => setForm({ ...form, productId: e.target.value })} options={products.map(product => ({ value: product.id, label: `${product.name} (${product.unit || '-'}) - ${formatRp(product.sellingPrice)} - Stok ${product.stock}` }))} /><div className="grid grid-cols-2 gap-4 md:gap-5"><Input label="Jumlah (Qty)" type="number" min="0" value={form.qty} onChange={e => handleQtyChange(e.target.value)} required /><Button type="button" onClick={handleAddToCart} className="self-end h-[48px] bg-blue-600 hover:bg-blue-700">Tambah</Button></div></div>
+          <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-2xl"><table className="w-full text-left text-sm whitespace-nowrap"><thead className="bg-slate-50 dark:bg-[#111828] text-slate-500 dark:text-slate-400"><tr><th className="p-3 font-bold">Produk</th><th className="p-3 font-bold">Satuan</th><th className="p-3 font-bold">Qty</th><th className="p-3 font-bold">Harga Jual</th><th className="p-3 font-bold">Subtotal</th><th className="p-3 font-bold text-right">Aksi</th></tr></thead><tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">{cartItems.map(item => (<tr key={item.productId}><td className="p-3 font-bold text-slate-900 dark:text-slate-100">{item.productNameSnapshot}</td><td className="p-3 font-semibold text-slate-600 dark:text-slate-300">{item.unitSnapshot}</td><td className="p-3 font-black">{item.qty}</td><td className="p-3 font-semibold text-blue-600 dark:text-blue-400">{formatRp(item.sellingPriceSnapshot)}</td><td className="p-3 font-black text-blue-600 dark:text-blue-400">{formatRp(item.subtotalJual)}</td><td className="p-3 text-right"><button type="button" onClick={() => setCartItems(prev => prev.filter(cartItem => cartItem.productId !== item.productId))} className="px-3 py-2 text-xs font-bold text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-500/10 rounded-lg">Hapus</button></td></tr>))}{cartItems.length === 0 && <tr><td colSpan="6" className="p-5 text-center text-slate-500 font-medium">Keranjang LPNU masih kosong.</td></tr>}</tbody></table></div>
+          <div className="grid grid-cols-2 gap-3"><div className="rounded-2xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-4"><p className="text-[10px] font-black uppercase text-slate-500">Total Qty</p><p className="text-xl font-black mt-1 text-slate-900 dark:text-white">{totals.totalQty}</p></div><div className="rounded-2xl bg-blue-50 dark:bg-blue-500/10 border border-blue-100 dark:border-blue-500/20 p-4"><p className="text-[10px] font-black uppercase text-blue-600 dark:text-blue-400">Total Jual</p><p className="text-xl font-black mt-1 text-blue-700 dark:text-blue-300">{formatRp(totals.totalJual)}</p></div></div>
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0a0f1c] overflow-hidden">
+            <button type="button" onClick={() => setShowPembagianDetails(prev => !prev)} className="w-full flex items-center justify-between gap-3 px-4 py-3 text-sm font-black text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"><span>Lihat Rincian Pembagian</span><span className="text-blue-600 dark:text-blue-400">{showPembagianDetails ? 'Tutup' : 'Buka'}</span></button>
+            {showPembagianDetails && (
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-3 p-4 border-t border-slate-100 dark:border-slate-800">
+                {[
+                  ['Supplier/H. Rajab', totals.supplierAmount],
+                  ['LPNU/Kang Memet', totals.lpnuAmount],
+                  ['PCNU', totals.pcnuAmount],
+                  ['LAZISNU', totals.lazisnuAmount],
+                  ['Infaq LAZISNU', totals.lazisnuInfaqAmount],
+                  ['Sisa/Pengelola', totals.sisaPengelola]
+                ].map(([label, value]) => (<div key={label} className="rounded-xl bg-slate-50 dark:bg-[#111828] border border-slate-100 dark:border-slate-800 p-3"><p className="text-[10px] font-black uppercase text-slate-500">{label}</p><p className="text-sm font-black mt-1 text-slate-900 dark:text-white">{formatRp(value)}</p></div>))}
+              </div>
+            )}
+          </div>
           <Button type="submit" disabled={cartItems.length === 0} className="w-full py-4 text-base bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400">Simpan Transaksi LPNU</Button>
         </form>
       </Card>
@@ -4384,8 +4587,8 @@ export default function App() {
                 {view === 'lpnu-sales' && <LpnuSalesView showToast={showToast} />}
                 {view === 'lpnu-products' && <LpnuProductsView showToast={showToast} />}
                 {view === 'lpnu-stock' && <LpnuProductsView showToast={showToast} />}
-                {view === 'lpnu-reports' && <LpnuPlaceholderView title="Laporan LPNU" description="Laporan khusus produk LPNU akan terpisah dari laporan Stikernisasi." />}
-                {view === 'lpnu-finance' && <LpnuPlaceholderView title="Keuangan LPNU" description="Keuangan LPNU memakai modal, omzet, margin, biaya, dan laba bersih." />}
+                {view === 'lpnu-reports' && <LpnuPlaceholderView title="Laporan LPNU" description="Laporan khusus produk LPNU akan terpisah dari laporan Stikernisasi, termasuk rincian pembagian per transaksi."><div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-left text-sm"><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Penjualan Harian</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Produk</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Bulanan</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Supplier/H. Rajab</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap LPNU/Kang Memet</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap PCNU</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap LAZISNU</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Infaq LAZISNU</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Sisa/Pengelola</div></div></LpnuPlaceholderView>}
+                {view === 'lpnu-finance' && <LpnuPlaceholderView title="Keuangan LPNU" description="Keuangan LPNU memakai modal, omzet, margin, biaya, laba bersih, dan rincian pembagian."><div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3 text-left text-sm"><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Supplier/H. Rajab</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap LPNU/Kang Memet</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap PCNU</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap LAZISNU</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Infaq LAZISNU</div><div className="rounded-xl bg-slate-50 dark:bg-[#0a0f1c] border border-slate-100 dark:border-slate-800 p-3 font-bold">Rekap Sisa/Pengelola</div></div></LpnuPlaceholderView>}
                 {view === 'lpnu-spreadsheet' && <LpnuPlaceholderView title="Spreadsheet LPNU" description="Sync Spreadsheet LPNU akan menggunakan tab khusus LPNU."><p className="mt-4 text-sm font-bold text-blue-600 dark:text-blue-400">Tab rencana: LPNU - Dashboard, LPNU - Transaksi Detail, LPNU - Rekap Transaksi, LPNU - Keuangan, LPNU - Produk Stok.</p></LpnuPlaceholderView>}
                 {view === 'lpnu-settings' && <LpnuPlaceholderView title="Pengaturan LPNU" description="Pengaturan LPNU akan disiapkan setelah rumus pembagian hasil final." />}
               </LpnuLayout>
