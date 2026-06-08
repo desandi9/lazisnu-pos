@@ -15,6 +15,14 @@ import {
   updateProductStockInDb
 } from './services/database/dbProductService';
 import {
+  checkLpnuProductHasTransactions,
+  createLpnuProductInDb,
+  deleteLpnuProductFromDb,
+  setLpnuProductActiveInDb,
+  syncLpnuProductsCacheFromDb,
+  updateLpnuProductInDb
+} from './services/database/dbLpnuProductService';
+import {
   createUserInDb,
   deleteUserFromDb,
   getUserByUsernameFromDb,
@@ -1552,15 +1560,34 @@ const sortLpnuProducts = (products) => products.slice().sort((a, b) => {
 });
 
 const LpnuOverviewView = ({ setView }) => {
-  const products = db.getLpnuProducts();
+  const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts()));
   const transactions = db.getLpnuTransactions();
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await syncLpnuProductsCacheFromDb();
+      const sourceProducts = result.success ? result.data : db.getLpnuProducts();
+
+      if (!isMounted) return;
+      setProducts(sortLpnuProducts(sourceProducts));
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   const stats = {
     totalProducts: products.length,
     totalStock: products.reduce((sum, product) => sum + Number(product.stock || 0), 0),
     omzet: transactions.reduce((sum, tx) => sum + Number(tx.totalJual || 0), 0),
     labaKotor: transactions.reduce((sum, tx) => sum + Number(tx.labaKotor || 0), 0),
     labaBersih: transactions.reduce((sum, tx) => sum + Number(tx.labaBersih || 0), 0),
-    criticalStock: products.filter(product => product.stock > 0 && product.stock <= product.minStock).length
+    criticalStock: products.filter(product => product.stock > 0 && product.stock <= product.minStock).length,
+    emptyStock: products.filter(product => Number(product.stock || 0) <= 0).length,
+    inactiveProducts: products.filter(product => !product.isActive).length
   };
 
   return (
@@ -1570,14 +1597,16 @@ const LpnuOverviewView = ({ setView }) => {
         <p className="text-sm text-slate-500 mt-1.5">Ringkasan produk kolaborasi LAZISNU dan LPNU Garut.</p>
       </header>
 
-      <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         {[
           ['Total Produk LPNU', stats.totalProducts],
           ['Total Stok', stats.totalStock],
           ['Omzet LPNU', formatRp(stats.omzet)],
           ['Laba Kotor', formatRp(stats.labaKotor)],
           ['Laba Bersih', formatRp(stats.labaBersih)],
-          ['Stok Kritis', stats.criticalStock]
+          ['Stok Kritis', stats.criticalStock],
+          ['Produk Habis', stats.emptyStock],
+          ['Produk Nonaktif', stats.inactiveProducts]
         ].map(([label, value]) => (
           <Card key={label} className="p-4 border-slate-200/70 shadow-sm">
             <p className="text-[11px] font-black uppercase tracking-wide text-slate-500">{label}</p>
@@ -1625,42 +1654,142 @@ const LpnuProductsView = ({ showToast }) => {
   const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts()));
   const [formData, setFormData] = useState(createFormData);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
+  const [productSource, setProductSource] = useState('Lokal');
 
   const loadProducts = () => setProducts(sortLpnuProducts(db.getLpnuProducts()));
 
-  const handleSave = (event) => {
+  const refreshProducts = async () => {
+    const result = await syncLpnuProductsCacheFromDb();
+
+    if (result.success) {
+      const nextProducts = sortLpnuProducts(result.data);
+      setProducts(nextProducts);
+      setProductSource('Database');
+      return nextProducts;
+    }
+
+    const localProducts = sortLpnuProducts(db.getLpnuProducts());
+    setProducts(localProducts);
+    setProductSource('Lokal');
+    if (result.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal LPNU.', 'error');
+
+    return localProducts;
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await syncLpnuProductsCacheFromDb();
+      const sourceProducts = result.success ? result.data : db.getLpnuProducts();
+
+      if (!isMounted) return;
+      setProducts(sortLpnuProducts(sourceProducts));
+      setProductSource(result.success ? 'Database' : 'Lokal');
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleSave = async (event) => {
     event.preventDefault();
+    if (isSubmittingProduct) return;
     if (!formData.name.trim()) return showToast('Nama produk wajib diisi.', 'error');
     if (Number(formData.costPrice) < 0) return showToast('Harga modal tidak boleh negatif.', 'error');
     if (Number(formData.sellingPrice) <= 0) return showToast('Harga jual harus lebih dari 0.', 'error');
     if (Number(formData.stock) < 0) return showToast('Stok tidak boleh negatif.', 'error');
+    if (Number(formData.minStock) < 0) return showToast('Stok minimum tidak boleh negatif.', 'error');
     if (Number(formData.sellingPrice) < Number(formData.costPrice) && !window.confirm('Harga jual lebih kecil dari harga modal. Tetap simpan produk ini?')) return;
 
-    db.saveLpnuProduct({
+    const productPayload = {
       ...formData,
+      name: formData.name.trim(),
+      category: formData.category.trim(),
+      unit: formData.unit.trim(),
+      supplier: formData.supplier.trim(),
       costPrice: Number(formData.costPrice || 0),
       sellingPrice: Number(formData.sellingPrice || 0),
       stock: Number(formData.stock || 0),
       minStock: Number(formData.minStock || 0),
       isActive: Number(formData.stock || 0) > 0 ? formData.isActive : false
-    });
-    loadProducts();
-    setIsModalOpen(false);
-    showToast('Produk LPNU tersimpan.');
+    };
+
+    setIsSubmittingProduct(true);
+    try {
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const result = formData.id
+          ? await updateLpnuProductInDb(formData.id, productPayload)
+          : await createLpnuProductInDb(productPayload);
+
+        if (!result.success) throw new Error('Gagal menyimpan produk LPNU ke database.');
+
+        await refreshProducts();
+      } else {
+        db.saveLpnuProduct(productPayload);
+        loadProducts();
+        setProductSource('Lokal');
+        if (health.status !== 'not_configured') showToast('Database tidak tersedia, produk LPNU disimpan lokal.', 'error');
+      }
+
+      setIsModalOpen(false);
+      showToast('Produk LPNU tersimpan.');
+    } catch (error) {
+      showToast(error.message || 'Gagal menyimpan produk LPNU ke database.', 'error');
+    } finally {
+      setIsSubmittingProduct(false);
+    }
   };
 
-  const handleActiveChange = (product) => {
+  const handleActiveChange = async (product) => {
     if (!product.isActive && Number(product.stock || 0) <= 0) return showToast('Produk stok habis tidak bisa diaktifkan. Tambah stok terlebih dahulu.', 'error');
-    db.saveLpnuProduct({ ...product, isActive: !product.isActive });
-    loadProducts();
-    showToast(product.isActive ? 'Produk LPNU dinonaktifkan.' : 'Produk LPNU diaktifkan.');
+
+    const nextActive = !product.isActive;
+    try {
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const result = await setLpnuProductActiveInDb(product.id, nextActive);
+        if (!result.success) throw new Error('Gagal menyimpan produk LPNU ke database.');
+
+        await refreshProducts();
+      } else {
+        db.saveLpnuProduct({ ...product, isActive: nextActive });
+        loadProducts();
+        setProductSource('Lokal');
+        if (health.status !== 'not_configured') showToast('Database tidak tersedia, menggunakan data lokal LPNU.', 'error');
+      }
+
+      showToast(product.isActive ? 'Produk LPNU dinonaktifkan.' : 'Produk LPNU diaktifkan.');
+    } catch (error) {
+      showToast(error.message || 'Gagal menyimpan produk LPNU ke database.', 'error');
+    }
   };
 
-  const handleDelete = (product) => {
+  const handleDelete = async (product) => {
     if (!window.confirm('Hapus produk LPNU ini?')) return;
     try {
-      db.deleteLpnuProduct(product.id);
-      loadProducts();
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const txResult = await checkLpnuProductHasTransactions(product);
+        if (!txResult.success) throw new Error(txResult.error || 'Gagal mengecek transaksi produk LPNU.');
+        if (txResult.data) throw new Error('Produk LPNU ini sudah memiliki riwayat transaksi. Nonaktifkan saja agar laporan tetap aman.');
+
+        const result = await deleteLpnuProductFromDb(product.id);
+        if (!result.success) throw new Error('Gagal menghapus produk LPNU ke database.');
+
+        await refreshProducts();
+      } else {
+        db.deleteLpnuProduct(product.id);
+        loadProducts();
+        setProductSource('Lokal');
+      }
+
       showToast('Produk LPNU dihapus.');
     } catch (error) {
       showToast(error.message, 'error');
@@ -1673,6 +1802,7 @@ const LpnuProductsView = ({ showToast }) => {
         <div>
           <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Produk LPNU</h1>
           <p className="text-sm text-slate-500 mt-1.5">Kelola harga modal, harga jual, supplier, dan stok produk LPNU.</p>
+          <p className="text-xs font-bold text-blue-600 dark:text-blue-400 mt-2">Sumber Produk LPNU: {productSource}</p>
         </div>
         <Button onClick={() => { setFormData(createFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto bg-blue-600 hover:bg-blue-700"><Plus size={20} /> Tambah Produk LPNU</Button>
       </header>
@@ -1714,7 +1844,7 @@ const LpnuProductsView = ({ showToast }) => {
               <div className="grid grid-cols-2 gap-4"><Input label="Stok" type="number" min="0" value={formData.stock} onChange={e => setFormData({ ...formData, stock: e.target.value })} required /><Input label="Stok Minimum" type="number" min="0" value={formData.minStock} onChange={e => setFormData({ ...formData, minStock: e.target.value })} required /></div>
               <Input label="Supplier/Mitra" value={formData.supplier} onChange={e => setFormData({ ...formData, supplier: e.target.value })} />
               <div className="flex items-center gap-3 pt-3 pb-3 bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-100 dark:border-slate-800"><input type="checkbox" checked={formData.isActive} onChange={e => setFormData({ ...formData, isActive: e.target.checked })} id="lpnuIsActive" className="w-6 h-6 rounded border-slate-300 text-blue-600 focus:ring-blue-500" /><label htmlFor="lpnuIsActive" className="text-sm font-bold cursor-pointer select-none">Produk Aktif</label></div>
-              <div className="flex gap-3 pt-4"><Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button><Button type="submit" className="flex-1 bg-blue-600 hover:bg-blue-700">Simpan</Button></div>
+              <div className="flex gap-3 pt-4"><Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button><Button type="submit" isLoading={isSubmittingProduct} className="flex-1 bg-blue-600 hover:bg-blue-700">Simpan</Button></div>
             </form>
           </Card>
         </div>
@@ -1730,6 +1860,22 @@ const LpnuSalesView = ({ showToast }) => {
   const [cartItems, setCartItems] = useState([]);
   const selectedProduct = products.find(product => product.id === form.productId);
   const totals = calculateLpnuTotals(cartItems, form.biayaOperasional);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    queueMicrotask(async () => {
+      const result = await syncLpnuProductsCacheFromDb();
+      const sourceProducts = result.success ? result.data : db.getLpnuProducts();
+
+      if (!isMounted) return;
+      setProducts(sortLpnuProducts(sourceProducts.filter(product => product.isActive && product.stock > 0)));
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const handleQtyChange = (value) => {
     const digitsOnly = value.replace(/\D/g, '');
