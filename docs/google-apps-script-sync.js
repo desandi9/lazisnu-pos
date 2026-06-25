@@ -1,121 +1,91 @@
 /**
- * Google Apps Script Web App untuk sinkronisasi LAZISNU POS ke beberapa sheet.
+ * Google Apps Script Web App untuk sync full-refresh Modul Stikernisasi.
  *
  * Sheet yang dibuat/dipakai:
  * 1. Dashboard Statistik
- * 2. Transaksi Detail
- * 3. Rekap Transaksi
+ * 2. Rekap Transaksi
+ * 3. Transaksi Detail
  * 4. Rekap Laba
  * 5. Rekap Petugas
+ * 6. Piutang
+ * 7. Uang di Luar
+ * 8. Stok Barang
  */
 
 const SPREADSHEET_ID = ''; // Opsional. Isi ID spreadsheet jika script tidak bound ke Google Sheet tujuan.
 
 const SHEETS = {
   dashboard: 'Dashboard Statistik',
-  detail: 'Transaksi Detail',
   transactions: 'Rekap Transaksi',
+  detail: 'Transaksi Detail',
   profit: 'Rekap Laba',
-  officers: 'Rekap Petugas'
+  officers: 'Rekap Petugas',
+  debt: 'Piutang',
+  outsideMoney: 'Uang di Luar',
+  stock: 'Stok Barang'
 };
 
-const DASHBOARD_COLORS = {
+const COLORS = {
   emerald: '#059669',
   emeraldDark: '#047857',
-  emeraldLight: '#d1fae5',
-  border: '#d1d5db'
+  emeraldSoft: '#d1fae5',
+  emeraldPale: '#ecfdf5',
+  amber: '#f59e0b',
+  amberSoft: '#fef3c7',
+  red: '#dc2626',
+  redSoft: '#fee2e2',
+  slate: '#0f172a',
+  slateText: '#334155',
+  gray: '#f8fafc',
+  border: '#d1d5db',
+  white: '#ffffff'
 };
 
 const HEADERS = {
-  detail: [
-    'No. Transaksi',
-    'Tanggal',
-    'Pembeli',
-    'Petugas',
-    'Role',
-    'Produk',
-    'Kategori',
-    'Ukuran',
-    'Qty',
-    'Harga',
-    'Subtotal',
-    'Total Transaksi',
-    'Metode',
-    'Catatan',
-    'Waktu Sync'
-  ],
-  transactions: [
-    'No. Transaksi',
-    'Tanggal',
-    'Pembeli',
-    'Petugas',
-    'Role',
-    'Jumlah Item',
-    'Total Qty',
-    'Total Transaksi',
-    'Metode',
-    'Catatan',
-    'Status Sync',
-    'Waktu Sync'
-  ],
-  profit: [
-    'No. Transaksi',
-    'Tanggal',
-    'Pembeli',
-    'Petugas',
-    'Total Transaksi',
-    '% LAZISNU',
-    'Rp LAZISNU',
-    '% PCNU',
-    'Rp PCNU',
-    '% Petugas',
-    'Rp Petugas',
-    '% Pengelola',
-    'Rp Pengelola',
-    'Waktu Sync'
-  ],
-  officers: [
-    'Petugas',
-    'Role',
-    'Jumlah Transaksi',
-    'Total Qty',
-    'Total Omzet',
-    'Rp LAZISNU',
-    'Rp PCNU',
-    'Rp Petugas',
-    'Rp Pengelola',
-    'Terakhir Update'
-  ]
+  transactions: ['Tanggal', 'Invoice', 'Pembeli', 'Petugas', 'Qty', 'Total', 'Metode', 'Status Pembayaran', 'LAZISNU', 'PCNU', 'Bagian Petugas', 'Pengelola'],
+  detail: ['Tanggal', 'Invoice', 'Produk', 'Kategori', 'Ukuran', 'Qty', 'Harga', 'Subtotal', 'Pembeli', 'Petugas'],
+  profit: ['Tanggal', 'Invoice', 'Total', 'LAZISNU', 'PCNU', 'Petugas', 'Pengelola'],
+  officers: ['Petugas', 'Jumlah Transaksi', 'Total Omzet', 'Total Qty', 'Total Bagian Petugas'],
+  debt: ['Tanggal', 'Invoice', 'Nama Pengutang', 'Produk', 'Qty', 'Total Transaksi', 'Sudah Dibayar', 'Sisa Piutang', 'Status', 'Jatuh Tempo', 'Catatan', 'Petugas'],
+  outsideMoney: ['Produk', 'Nama Pengutang', 'Invoice', 'Tanggal', 'Qty Piutang', 'Harga', 'Total', 'Sudah Dibayar', 'Sisa', 'Status'],
+  stock: ['Produk', 'Masuk', 'Terjual', 'Piutang', 'Hilang', 'Sisa']
 };
 
 function doPost(e) {
   try {
     const payload = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-    const rows = Array.isArray(payload.rows) ? payload.rows : [];
 
-    if (rows.length === 0) {
-      return jsonResponse({ success: false, message: 'Payload rows kosong.' });
+    if (payload.syncMode !== 'fullRefresh' || !payload.sheets) {
+      return jsonResponse({ success: false, message: 'Payload tidak valid. Deploy Apps Script terbaru dan kirim mode fullRefresh.' });
     }
 
     const spreadsheet = SPREADSHEET_ID
       ? SpreadsheetApp.openById(SPREADSHEET_ID)
       : SpreadsheetApp.getActiveSpreadsheet();
     const sheets = setupSheets(spreadsheet);
-    const grouped = groupRowsByTransaction(rows);
+    const data = normalizePayloadSheets(payload.sheets);
+    const syncedAt = toDate(payload.syncedAt) || new Date();
 
-    appendRows(sheets.detail, HEADERS.detail, rows.map(toDetailRow));
-    appendRows(sheets.transactions, HEADERS.transactions, Object.values(grouped).map(toTransactionRow));
-    appendRows(sheets.profit, HEADERS.profit, Object.values(grouped).map(toProfitRow));
+    refreshDataSheet(sheets.transactions, HEADERS.transactions, data.transactions);
+    refreshDataSheet(sheets.detail, HEADERS.detail, data.detail);
+    refreshDataSheet(sheets.profit, HEADERS.profit, data.profit);
+    refreshDataSheet(sheets.officers, HEADERS.officers, data.officers);
+    refreshDataSheet(sheets.debt, HEADERS.debt, data.debt);
+    refreshDataSheet(sheets.outsideMoney, HEADERS.outsideMoney, data.outsideMoney);
+    refreshDataSheet(sheets.stock, HEADERS.stock, data.stock);
 
-    rebuildOfficerSummary(sheets.transactions, sheets.profit, sheets.officers);
-    rebuildDashboardStatistik(sheets);
+    rebuildDashboardStatistik(sheets.dashboard, data, syncedAt);
 
-    [sheets.detail, sheets.transactions, sheets.profit, sheets.officers].forEach(formatSheet);
+    [sheets.transactions, sheets.detail, sheets.profit, sheets.officers, sheets.debt, sheets.outsideMoney, sheets.stock].forEach(formatDataSheet);
 
     return jsonResponse({
       success: true,
-      detailRows: rows.length,
-      transactionRows: Object.keys(grouped).length
+      mode: 'fullRefresh',
+      refreshedSheets: Object.keys(SHEETS).length,
+      transactionRows: data.transactions.length,
+      detailRows: data.detail.length,
+      debtRows: data.debt.length,
+      stockRows: data.stock.length
     });
   } catch (error) {
     return jsonResponse({ success: false, message: error.message });
@@ -123,269 +93,148 @@ function doPost(e) {
 }
 
 function setupSheets(spreadsheet) {
-  const sheets = {
+  return {
     dashboard: getOrCreateSheet(spreadsheet, SHEETS.dashboard),
-    detail: getOrCreateSheet(spreadsheet, SHEETS.detail),
     transactions: getOrCreateSheet(spreadsheet, SHEETS.transactions),
+    detail: getOrCreateSheet(spreadsheet, SHEETS.detail),
     profit: getOrCreateSheet(spreadsheet, SHEETS.profit),
-    officers: getOrCreateSheet(spreadsheet, SHEETS.officers)
+    officers: getOrCreateSheet(spreadsheet, SHEETS.officers),
+    debt: getOrCreateSheet(spreadsheet, SHEETS.debt),
+    outsideMoney: getOrCreateSheet(spreadsheet, SHEETS.outsideMoney),
+    stock: getOrCreateSheet(spreadsheet, SHEETS.stock)
   };
-
-  ensureHeaders(sheets.detail, HEADERS.detail);
-  ensureHeaders(sheets.transactions, HEADERS.transactions);
-  ensureHeaders(sheets.profit, HEADERS.profit);
-  ensureHeaders(sheets.officers, HEADERS.officers);
-
-  return sheets;
 }
 
 function getOrCreateSheet(spreadsheet, sheetName) {
   return spreadsheet.getSheetByName(sheetName) || spreadsheet.insertSheet(sheetName);
 }
 
-function ensureHeaders(sheet, headers) {
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    return;
+function normalizePayloadSheets(sheets) {
+  return {
+    transactions: toArray(sheets.rekapTransaksi),
+    detail: toArray(sheets.transaksiDetail),
+    profit: toArray(sheets.rekapLaba),
+    officers: toArray(sheets.rekapPetugas),
+    debt: toArray(sheets.piutang),
+    outsideMoney: toArray(sheets.uangDiLuar),
+    stock: toArray(sheets.stokBarang)
+  };
+}
+
+function toArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function refreshDataSheet(sheet, headers, rows) {
+  clearSheet(sheet);
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows.map(row => headers.map(header => getCellValue(row, header))));
   }
-
-  const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-  const hasHeaders = headers.every((header, index) => currentHeaders[index] === header);
-
-  if (!hasHeaders) {
-    sheet.insertRowBefore(1);
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  }
 }
 
-function appendRows(sheet, headers, values) {
-  if (values.length === 0) return;
-  sheet.getRange(sheet.getLastRow() + 1, 1, values.length, headers.length).setValues(values);
-}
+function clearSheet(sheet) {
+  const filter = sheet.getFilter();
+  if (filter) filter.remove();
 
-function groupRowsByTransaction(rows) {
-  return rows.reduce((acc, row) => {
-    const transactionId = row['No. Transaksi'];
-
-    if (!acc[transactionId]) {
-      acc[transactionId] = {
-        first: row,
-        itemCount: 0,
-        totalQty: 0
-      };
-    }
-
-    acc[transactionId].itemCount += 1;
-    acc[transactionId].totalQty += Number(row.Qty || 0);
-
-    return acc;
-  }, {});
-}
-
-function toDetailRow(row) {
-  return HEADERS.detail.map(header => getCellValue(row, header));
-}
-
-function toTransactionRow(group) {
-  const row = group.first;
-
-  return [
-    row['No. Transaksi'],
-    getCellValue(row, 'Tanggal'),
-    row.Pembeli,
-    row.Petugas,
-    row.Role,
-    group.itemCount,
-    group.totalQty,
-    row['Total Transaksi'],
-    row.Metode,
-    row.Catatan,
-    'synced',
-    getCellValue(row, 'Waktu Sync')
-  ];
-}
-
-function toProfitRow(group) {
-  const row = group.first;
-
-  return [
-    row['No. Transaksi'],
-    getCellValue(row, 'Tanggal'),
-    row.Pembeli,
-    row.Petugas,
-    row['Total Transaksi'],
-    row['% LAZISNU'],
-    row['Rp LAZISNU'],
-    row['% PCNU'],
-    row['Rp PCNU'],
-    row['% Petugas'],
-    row['Rp Petugas'],
-    row['% Pengelola'],
-    row['Rp Pengelola'],
-    getCellValue(row, 'Waktu Sync')
-  ];
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
+  sheet.clear();
 }
 
 function getCellValue(row, header) {
   const value = row[header] ?? '';
 
-  if (['Tanggal', 'Waktu Sync', 'Terakhir Update'].includes(header) && value) {
-    return new Date(value);
+  if (['Tanggal', 'Jatuh Tempo', 'Terakhir Update'].includes(header) && value) {
+    return toDate(value) || value;
   }
 
   return value;
 }
 
-function rebuildOfficerSummary(transactionSheet, profitSheet, officerSheet) {
-  ensureHeaders(officerSheet, HEADERS.officers);
+function rebuildDashboardStatistik(sheet, data, syncedAt) {
+  clearSheet(sheet);
 
-  const transactionRows = getDataRows(transactionSheet, HEADERS.transactions);
-  const profitRows = getDataRows(profitSheet, HEADERS.profit);
-  const profitByTransaction = profitRows.reduce((acc, row) => {
-    acc[row['No. Transaksi']] = row;
-    return acc;
-  }, {});
-  const summary = transactionRows.reduce((acc, row) => {
-    const officer = row.Petugas || '-';
-    const profit = profitByTransaction[row['No. Transaksi']] || {};
+  const summary = buildSummary(data);
+  const todayStats = buildPeriodStats(data, new Date(), isSameDay);
+  const monthStats = buildPeriodStats(data, new Date(), isSameMonth);
+  const topOfficers = buildTopOfficerRows(data.officers);
+  const bestSellers = buildBestSellerRows(data.detail);
+  const stockRows = data.stock.map(row => [row.Produk, toNumber(row.Masuk), toNumber(row.Terjual), toNumber(row.Piutang), toNumber(row.Hilang), toNumber(row.Sisa)]);
+  const outsideRows = data.outsideMoney.map(row => [row.Produk, row['Nama Pengutang'], toNumber(row['Qty Piutang']), toNumber(row.Total), toNumber(row['Sudah Dibayar']), toNumber(row.Sisa), row.Status]);
 
-    if (!acc[officer]) {
-      acc[officer] = {
-        Petugas: officer,
-        Role: row.Role || '-',
-        'Jumlah Transaksi': 0,
-        'Total Qty': 0,
-        'Total Omzet': 0,
-        'Rp LAZISNU': 0,
-        'Rp PCNU': 0,
-        'Rp Petugas': 0,
-        'Rp Pengelola': 0,
-        'Terakhir Update': row['Waktu Sync'] || new Date()
-      };
-    }
+  sheet.getRange(1, 1, 1, 12).merge().setValue('DASHBOARD STATISTIK PENJUALAN LAZISNU GARUT');
+  sheet.getRange(2, 1, 1, 12).merge().setValue('Modul Stikernisasi');
+  sheet.getRange(3, 1).setValue('Terakhir Update');
+  sheet.getRange(3, 2).setValue(syncedAt);
 
-    acc[officer]['Jumlah Transaksi'] += 1;
-    acc[officer]['Total Qty'] += Number(row['Total Qty'] || 0);
-    acc[officer]['Total Omzet'] += Number(row['Total Transaksi'] || 0);
-    acc[officer]['Rp LAZISNU'] += Number(profit['Rp LAZISNU'] || 0);
-    acc[officer]['Rp PCNU'] += Number(profit['Rp PCNU'] || 0);
-    acc[officer]['Rp Petugas'] += Number(profit['Rp Petugas'] || 0);
-    acc[officer]['Rp Pengelola'] += Number(profit['Rp Pengelola'] || 0);
-    acc[officer]['Terakhir Update'] = row['Waktu Sync'] || acc[officer]['Terakhir Update'];
-
-    return acc;
-  }, {});
-
-  if (officerSheet.getLastRow() > 1) {
-    officerSheet.getRange(2, 1, officerSheet.getLastRow() - 1, HEADERS.officers.length).clearContent();
-  }
-
-  const values = Object.values(summary).map(row => HEADERS.officers.map(header => getCellValue(row, header)));
-  appendRows(officerSheet, HEADERS.officers, values);
-}
-
-function rebuildDashboardStatistik(sheets) {
-  const dashboardSheet = sheets.dashboard;
-  const detailRows = getDataRows(sheets.detail, HEADERS.detail);
-  const transactionRows = getDataRows(sheets.transactions, HEADERS.transactions);
-  const profitRows = getDataRows(sheets.profit, HEADERS.profit);
-  const officerRows = getDataRows(sheets.officers, HEADERS.officers);
-  const now = new Date();
-  const lastSyncTime = getLastSyncTime(detailRows, transactionRows, profitRows) || now;
-  const summary = buildDashboardSummary(transactionRows, profitRows, officerRows);
-  const todayStats = buildPeriodStats(transactionRows, profitRows, now, isSameDay);
-  const monthStats = buildPeriodStats(transactionRows, profitRows, now, isSameMonth);
-  const topOfficerRows = buildTopOfficerRows(officerRows);
-  const productRows = buildBestSellerRows(detailRows);
-
-  clearDashboardSheet(dashboardSheet);
-
-  dashboardSheet.getRange(1, 1, 1, 12).merge().setValue('DASHBOARD STATISTIK PENJUALAN LAZISNU GARUT');
-  dashboardSheet.getRange(2, 1).setValue('Terakhir Update');
-  dashboardSheet.getRange(2, 2).setValue(lastSyncTime);
-
-  writeMetricTable(dashboardSheet, 4, 1, 'Ringkasan Total', [
-    ['Total Transaksi', summary.totalTransactions],
+  writeMetricTable(sheet, 5, 1, 'A. Ringkasan Utama', [
+    ['Total Transaksi Sukses', summary.totalSuccessTransactions],
     ['Total Omzet', summary.totalRevenue],
-    ['Total Qty Terjual', summary.totalQty],
-    ['Total LAZISNU', summary.totalLazisnu],
-    ['Total PCNU', summary.totalPcnu],
-    ['Total Petugas', summary.totalOfficerShare],
-    ['Total Pengelola', summary.totalManagerShare],
-    ['Jumlah Petugas Aktif / Petugas dengan Transaksi', summary.activeOfficers]
+    ['Total Qty Terjual', summary.totalSoldQty],
+    ['Total Piutang', summary.totalDebtTransactions],
+    ['Uang di Luar', summary.outsideMoney],
+    ['Qty Barang Piutang', summary.debtQty],
+    ['Jumlah Pengutang', summary.debtorCount],
+    ['Petugas dengan Transaksi', summary.activeOfficers]
   ]);
 
-  writeMetricTable(dashboardSheet, 4, 4, 'Statistik Hari Ini', [
-    ['Transaksi Hari Ini', todayStats.transactions],
+  writeMetricTable(sheet, 5, 5, 'B. Statistik Hari Ini', [
+    ['Transaksi Hari Ini', todayStats.successTransactions],
     ['Omzet Hari Ini', todayStats.revenue],
-    ['Qty Terjual Hari Ini', todayStats.qty],
-    ['LAZISNU Hari Ini', todayStats.lazisnu],
-    ['PCNU Hari Ini', todayStats.pcnu],
-    ['Petugas Hari Ini', todayStats.officerShare],
-    ['Pengelola Hari Ini', todayStats.managerShare]
+    ['Qty Hari Ini', todayStats.soldQty],
+    ['Piutang Hari Ini', todayStats.debtTransactions],
+    ['Uang di Luar Hari Ini', todayStats.outsideMoney]
   ]);
 
-  writeMetricTable(dashboardSheet, 4, 7, 'Statistik Bulan Ini', [
-    ['Transaksi Bulan Ini', monthStats.transactions],
+  writeMetricTable(sheet, 5, 9, 'C. Statistik Bulan Ini', [
+    ['Transaksi Bulan Ini', monthStats.successTransactions],
     ['Omzet Bulan Ini', monthStats.revenue],
-    ['Qty Terjual Bulan Ini', monthStats.qty],
-    ['LAZISNU Bulan Ini', monthStats.lazisnu],
-    ['PCNU Bulan Ini', monthStats.pcnu],
-    ['Petugas Bulan Ini', monthStats.officerShare],
-    ['Pengelola Bulan Ini', monthStats.managerShare]
+    ['Qty Bulan Ini', monthStats.soldQty],
+    ['Piutang Bulan Ini', monthStats.debtTransactions],
+    ['Uang di Luar Bulan Ini', monthStats.outsideMoney]
   ]);
 
-  writeDataTable(
-    dashboardSheet,
-    16,
-    1,
-    'Top Petugas',
-    ['Ranking', 'Petugas', 'Jumlah Transaksi', 'Total Omzet', 'Bagian Petugas'],
-    topOfficerRows
-  );
+  writeDataTable(sheet, 17, 1, 'D. Top Petugas', ['Ranking', 'Petugas', 'Jumlah Transaksi Sukses', 'Total Omzet', 'Bagian Petugas'], topOfficers);
+  writeDataTable(sheet, 17, 7, 'E. Produk Terlaris', ['Ranking', 'Produk', 'Kategori', 'Ukuran', 'Total Qty Terjual', 'Total Penjualan'], bestSellers);
 
-  writeDataTable(
-    dashboardSheet,
-    16,
-    7,
-    'Produk Terlaris',
-    ['Ranking', 'Produk', 'Kategori', 'Ukuran', 'Total Qty', 'Total Penjualan'],
-    productRows
-  );
+  const stockStartRow = 17 + Math.max(topOfficers.length, bestSellers.length, 1) + 5;
+  writeDataTable(sheet, stockStartRow, 1, 'F. Ringkasan Stok Barang', HEADERS.stock, stockRows);
 
-  formatDashboardStatistik(dashboardSheet);
+  const debtStartRow = stockStartRow + Math.max(stockRows.length, 1) + 5;
+  writeDataTable(sheet, debtStartRow, 1, 'G. Ringkasan Piutang / Uang di Luar', ['Produk', 'Nama Pengutang', 'Qty', 'Total', 'Sudah Dibayar', 'Sisa', 'Status'], outsideRows);
+  formatDashboard(sheet, debtStartRow, outsideRows.length);
 }
 
-function buildDashboardSummary(transactionRows, profitRows, officerRows) {
+function buildSummary(data) {
   return {
-    totalTransactions: transactionRows.length,
-    totalRevenue: sumRows(transactionRows, 'Total Transaksi'),
-    totalQty: sumRows(transactionRows, 'Total Qty'),
-    totalLazisnu: sumRows(profitRows, 'Rp LAZISNU'),
-    totalPcnu: sumRows(profitRows, 'Rp PCNU'),
-    totalOfficerShare: sumRows(profitRows, 'Rp Petugas'),
-    totalManagerShare: sumRows(profitRows, 'Rp Pengelola'),
-    activeOfficers: officerRows.filter(row => toNumber(row['Jumlah Transaksi']) > 0).length
+    totalSuccessTransactions: data.transactions.length,
+    totalRevenue: sumRows(data.transactions, 'Total'),
+    totalSoldQty: sumRows(data.transactions, 'Qty'),
+    totalDebtTransactions: countUnique(data.debt, 'Invoice'),
+    outsideMoney: sumRows(data.outsideMoney, 'Sisa'),
+    debtQty: sumRows(data.stock, 'Piutang'),
+    debtorCount: countUnique(data.debt, 'Nama Pengutang'),
+    activeOfficers: data.officers.filter(row => toNumber(row['Jumlah Transaksi']) > 0).length
   };
 }
 
-function buildPeriodStats(transactionRows, profitRows, referenceDate, matcher) {
-  const periodTransactions = transactionRows.filter(row => matcher(row.Tanggal, referenceDate));
-  const periodProfits = profitRows.filter(row => matcher(row.Tanggal, referenceDate));
+function buildPeriodStats(data, referenceDate, matcher) {
+  const successTransactions = data.transactions.filter(row => matcher(row.Tanggal, referenceDate));
+  const outsideRows = data.outsideMoney.filter(row => matcher(row.Tanggal, referenceDate));
+  const debtRows = data.debt.filter(row => matcher(row.Tanggal, referenceDate));
 
   return {
-    transactions: periodTransactions.length,
-    revenue: sumRows(periodTransactions, 'Total Transaksi'),
-    qty: sumRows(periodTransactions, 'Total Qty'),
-    lazisnu: sumRows(periodProfits, 'Rp LAZISNU'),
-    pcnu: sumRows(periodProfits, 'Rp PCNU'),
-    officerShare: sumRows(periodProfits, 'Rp Petugas'),
-    managerShare: sumRows(periodProfits, 'Rp Pengelola')
+    successTransactions: successTransactions.length,
+    revenue: sumRows(successTransactions, 'Total'),
+    soldQty: sumRows(successTransactions, 'Qty'),
+    debtTransactions: countUnique(debtRows, 'Invoice'),
+    outsideMoney: sumRows(outsideRows, 'Sisa')
   };
 }
 
-function buildTopOfficerRows(officerRows) {
-  return officerRows
+function buildTopOfficerRows(rows) {
+  return rows
     .slice()
     .sort((a, b) => toNumber(b['Total Omzet']) - toNumber(a['Total Omzet']))
     .map((row, index) => [
@@ -393,74 +242,238 @@ function buildTopOfficerRows(officerRows) {
       row.Petugas || '-',
       toNumber(row['Jumlah Transaksi']),
       toNumber(row['Total Omzet']),
-      toNumber(row['Rp Petugas'])
+      toNumber(row['Total Bagian Petugas'])
     ]);
 }
 
-function buildBestSellerRows(detailRows) {
-  const products = detailRows.reduce((acc, row) => {
+function buildBestSellerRows(rows) {
+  const products = rows.reduce((acc, row) => {
     const product = row.Produk || '-';
     const category = row.Kategori || '-';
     const size = row.Ukuran || '-';
     const key = [product, category, size].join('||');
 
     if (!acc[key]) {
-      acc[key] = {
-        product,
-        category,
-        size,
-        qty: 0,
-        sales: 0
-      };
+      acc[key] = { product, category, size, qty: 0, sales: 0 };
     }
 
     acc[key].qty += toNumber(row.Qty);
-    acc[key].sales += toNumber(row.Subtotal || (toNumber(row.Qty) * toNumber(row.Harga)));
+    acc[key].sales += toNumber(row.Subtotal);
 
     return acc;
   }, {});
 
   return Object.values(products)
     .sort((a, b) => (b.qty - a.qty) || (b.sales - a.sales))
-    .map((row, index) => [
-      index + 1,
-      row.product,
-      row.category,
-      row.size,
-      row.qty,
-      row.sales
-    ]);
+    .map((row, index) => [index + 1, row.product, row.category, row.size, row.qty, row.sales]);
 }
 
-function getLastSyncTime(detailRows, transactionRows, profitRows) {
-  return detailRows.concat(transactionRows, profitRows).reduce((latest, row) => {
-    const syncTime = toDate(row['Waktu Sync']);
+function writeMetricTable(sheet, startRow, startColumn, title, rows) {
+  const width = 3;
+  sheet.getRange(startRow, startColumn, 1, width).merge().setValue(title)
+    .setBackground(COLORS.emeraldDark)
+    .setFontColor(COLORS.white)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
 
-    if (!syncTime) return latest;
-    if (!latest || syncTime.getTime() > latest.getTime()) return syncTime;
+  sheet.getRange(startRow + 1, startColumn, 1, width)
+    .setValues([['Metrik', 'Nilai', 'Keterangan']])
+    .setBackground(COLORS.emeraldSoft)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
 
-    return latest;
-  }, null);
+  const values = rows.map(row => [row[0], row[1], isCurrencyMetric(row[0]) ? 'Rp' : '']);
+  sheet.getRange(startRow + 2, startColumn, values.length, width).setValues(values);
+  sheet.getRange(startRow, startColumn, values.length + 2, width)
+    .setBackground(COLORS.white)
+    .setBorder(true, true, true, true, true, true, COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(startRow, startColumn, 1, width).setBackground(COLORS.emeraldDark);
+  sheet.getRange(startRow + 1, startColumn, 1, width).setBackground(COLORS.emeraldSoft);
+  sheet.getRange(startRow + 2, startColumn + 1, values.length, 1).setHorizontalAlignment('right');
+
+  rows.forEach((row, index) => {
+    const valueCell = sheet.getRange(startRow + 2 + index, startColumn + 1);
+    valueCell.setNumberFormat(isCurrencyMetric(row[0]) ? 'Rp #,##0' : '#,##0');
+  });
+}
+
+function writeDataTable(sheet, startRow, startColumn, title, headers, rows) {
+  sheet.getRange(startRow, startColumn, 1, headers.length).merge().setValue(title)
+    .setBackground(COLORS.emeraldDark)
+    .setFontColor(COLORS.white)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  sheet.getRange(startRow + 1, startColumn, 1, headers.length).setValues([headers])
+    .setBackground(COLORS.emerald)
+    .setFontColor(COLORS.white)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+
+  if (rows.length === 0) {
+    sheet.getRange(startRow + 2, startColumn, 1, headers.length).merge().setValue('Belum ada data.');
+    sheet.getRange(startRow, startColumn, 3, headers.length).setBorder(true, true, true, true, true, true, COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
+    return;
+  }
+
+  sheet.getRange(startRow + 2, startColumn, rows.length, headers.length).setValues(rows);
+  sheet.getRange(startRow, startColumn, rows.length + 2, headers.length)
+    .setBorder(true, true, true, true, true, true, COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
+}
+
+function formatDashboard(sheet, debtStartRow, debtRowCount) {
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  sheet.setFrozenRows(3);
+  sheet.setHiddenGridlines(true);
+  sheet.getRange(1, 1, lastRow, 12).setWrap(true).setVerticalAlignment('middle');
+  sheet.getRange(1, 1, 1, 12)
+    .setBackground(COLORS.emerald)
+    .setFontColor(COLORS.white)
+    .setFontWeight('bold')
+    .setFontSize(16)
+    .setHorizontalAlignment('center');
+  sheet.getRange(2, 1, 1, 12)
+    .setBackground(COLORS.emeraldPale)
+    .setFontColor(COLORS.emeraldDark)
+    .setFontWeight('bold')
+    .setFontSize(11)
+    .setHorizontalAlignment('center');
+  sheet.getRange(3, 1, 1, 2)
+    .setBackground(COLORS.gray)
+    .setFontWeight('bold')
+    .setBorder(true, true, true, true, true, true, COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(3, 2).setNumberFormat('dd/MM/yyyy HH:mm');
+  sheet.getRange(1, 1, lastRow, 12).setFontFamily('Arial');
+  sheet.setRowHeight(1, 38);
+  sheet.setRowHeight(2, 26);
+  sheet.getRange(19, 1, Math.max(lastRow - 18, 1), 1).setHorizontalAlignment('center');
+  sheet.getRange(19, 4, Math.max(lastRow - 18, 1), 2).setNumberFormat('Rp #,##0').setHorizontalAlignment('right');
+  sheet.getRange(19, 7, Math.max(lastRow - 18, 1), 1).setHorizontalAlignment('center');
+  sheet.getRange(19, 11, Math.max(lastRow - 18, 1), 1).setNumberFormat('#,##0').setHorizontalAlignment('center');
+  sheet.getRange(19, 12, Math.max(lastRow - 18, 1), 1).setNumberFormat('Rp #,##0').setHorizontalAlignment('right');
+
+  if (debtRowCount > 0) {
+    applyStatusColors(sheet, debtStartRow + 2, 7, debtRowCount);
+  }
+
+  for (let column = 1; column <= 12; column += 1) {
+    sheet.autoResizeColumn(column);
+  }
+}
+
+function formatDataSheet(sheet) {
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn === 0) return;
+
+  sheet.setFrozenRows(1);
+  sheet.setHiddenGridlines(true);
+
+  const filter = sheet.getFilter();
+  if (filter) filter.remove();
+
+  sheet.getRange(1, 1, lastRow, lastColumn)
+    .setFontFamily('Arial')
+    .setWrap(true)
+    .setBorder(true, true, true, true, true, true, COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(1, 1, 1, lastColumn)
+    .setFontWeight('bold')
+    .setBackground(COLORS.emerald)
+    .setFontColor(COLORS.white)
+    .setHorizontalAlignment('center');
+
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, lastColumn).setBackground(COLORS.white);
+    sheet.getRange(1, 1, lastRow, lastColumn).createFilter();
+    applyColumnFormats(sheet);
+    applySheetStatusColors(sheet);
+  }
+
+  for (let column = 1; column <= lastColumn; column += 1) {
+    sheet.autoResizeColumn(column);
+  }
+}
+
+function applyColumnFormats(sheet) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const lastRow = Math.max(sheet.getLastRow() - 1, 1);
+  const sheetName = sheet.getName();
+
+  headers.forEach((header, index) => {
+    const column = index + 1;
+    const range = sheet.getRange(2, column, lastRow, 1);
+    const isStockSheet = sheetName === SHEETS.stock;
+    const isProfitPetugasColumn = header === 'Petugas' && sheetName === SHEETS.profit;
+    const isCurrencyColumn = ['Harga', 'Subtotal', 'Total', 'Total Transaksi', 'Sudah Dibayar', 'Sisa Piutang', 'Total Omzet', 'LAZISNU', 'PCNU', 'Pengelola', 'Bagian Petugas', 'Total Bagian Petugas'].includes(header)
+      || (header === 'Sisa' && !isStockSheet)
+      || isProfitPetugasColumn;
+    const isQuantityColumn = ['Qty', 'Qty Piutang', 'Masuk', 'Terjual', 'Piutang', 'Hilang', 'Jumlah Transaksi', 'Total Qty'].includes(header)
+      || (header === 'Sisa' && isStockSheet);
+
+    if (['Tanggal', 'Jatuh Tempo', 'Terakhir Update'].includes(header)) {
+      range.setNumberFormat('dd/MM/yyyy HH:mm');
+    }
+
+    if (isCurrencyColumn) {
+      range.setNumberFormat('Rp #,##0').setHorizontalAlignment('right');
+    }
+
+    if (isQuantityColumn) {
+      range.setNumberFormat('#,##0').setHorizontalAlignment('center');
+    }
+  });
+}
+
+function applySheetStatusColors(sheet) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const statusColumn = headers.findIndex(header => ['Status', 'Status Pembayaran'].includes(header)) + 1;
+  if (statusColumn <= 0 || sheet.getLastRow() <= 1) return;
+
+  applyStatusColors(sheet, 2, statusColumn, sheet.getLastRow() - 1);
+}
+
+function applyStatusColors(sheet, startRow, statusColumn, rowCount) {
+  const values = sheet.getRange(startRow, statusColumn, rowCount, 1).getValues();
+
+  values.forEach((row, index) => {
+    const status = String(row[0] || '').toLowerCase();
+    const cell = sheet.getRange(startRow + index, statusColumn);
+
+    if (status.includes('lunas') && !status.includes('belum')) {
+      cell.setBackground(COLORS.emeraldSoft).setFontColor(COLORS.emeraldDark).setFontWeight('bold');
+    } else if (status.includes('dp') || status.includes('sebagian')) {
+      cell.setBackground(COLORS.amberSoft).setFontColor('#92400e').setFontWeight('bold');
+    } else if (status.includes('belum') || status.includes('pending')) {
+      cell.setBackground(COLORS.redSoft).setFontColor(COLORS.red).setFontWeight('bold');
+    }
+  });
+}
+
+function isCurrencyMetric(label) {
+  return [
+    'Total Omzet',
+    'Uang di Luar',
+    'Omzet Hari Ini',
+    'Uang di Luar Hari Ini',
+    'Omzet Bulan Ini',
+    'Uang di Luar Bulan Ini'
+  ].includes(label);
 }
 
 function sumRows(rows, header) {
   return rows.reduce((total, row) => total + toNumber(row[header]), 0);
 }
 
+function countUnique(rows, header) {
+  return new Set(rows.map(row => row[header]).filter(Boolean)).size;
+}
+
 function toNumber(value) {
-  if (typeof value === 'number') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if (value instanceof Date || value === null || value === undefined || value === '') return 0;
 
-  const text = String(value).trim();
-  const normalized = text.replace(/[^0-9,.-]/g, '');
-
-  if (/^-?\d{1,3}(,\d{3})+$/.test(normalized)) {
-    return Number(normalized.replace(/,/g, '')) || 0;
-  }
-
-  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(normalized)) {
-    return Number(normalized.replace(/\./g, '').replace(',', '.')) || 0;
-  }
+  const normalized = String(value).trim().replace(/[^0-9,.-]/g, '');
+  if (/^-?\d{1,3}(,\d{3})+$/.test(normalized)) return Number(normalized.replace(/,/g, '')) || 0;
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(normalized)) return Number(normalized.replace(/\./g, '').replace(',', '.')) || 0;
 
   return Number(normalized.replace(',', '.')) || 0;
 }
@@ -488,185 +501,6 @@ function isSameMonth(value, referenceDate) {
 
   return date.getFullYear() === referenceDate.getFullYear()
     && date.getMonth() === referenceDate.getMonth();
-}
-
-function clearDashboardSheet(sheet) {
-  const filter = sheet.getFilter();
-  if (filter) filter.remove();
-
-  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
-  sheet.clear();
-}
-
-function writeMetricTable(sheet, startRow, startColumn, title, rows) {
-  const titleRange = sheet.getRange(startRow, startColumn, 1, 2).merge().setValue(title);
-  titleRange
-    .setBackground(DASHBOARD_COLORS.emerald)
-    .setFontColor('#ffffff')
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center');
-
-  sheet.getRange(startRow + 1, startColumn, 1, 2)
-    .setValues([['Metrik', 'Nilai']])
-    .setBackground(DASHBOARD_COLORS.emeraldLight)
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center');
-
-  sheet.getRange(startRow + 2, startColumn, rows.length, 2).setValues(rows);
-  sheet.getRange(startRow, startColumn, rows.length + 2, 2)
-    .setBorder(true, true, true, true, true, true, DASHBOARD_COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
-
-  rows.forEach((row, index) => {
-    const valueCell = sheet.getRange(startRow + 2 + index, startColumn + 1);
-    valueCell.setHorizontalAlignment('right');
-
-    if (isCurrencyMetric(row[0])) {
-      valueCell.setNumberFormat('Rp #,##0');
-    } else {
-      valueCell.setNumberFormat('#,##0');
-    }
-  });
-}
-
-function writeDataTable(sheet, startRow, startColumn, title, headers, rows) {
-  const titleRange = sheet.getRange(startRow, startColumn, 1, headers.length).merge().setValue(title);
-  titleRange
-    .setBackground(DASHBOARD_COLORS.emeraldDark)
-    .setFontColor('#ffffff')
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center');
-
-  sheet.getRange(startRow + 1, startColumn, 1, headers.length)
-    .setValues([headers])
-    .setBackground(DASHBOARD_COLORS.emerald)
-    .setFontColor('#ffffff')
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center');
-
-  if (rows.length === 0) {
-    sheet.getRange(startRow + 2, startColumn, 1, headers.length).merge().setValue('Belum ada data.');
-    sheet.getRange(startRow, startColumn, 3, headers.length)
-      .setBorder(true, true, true, true, true, true, DASHBOARD_COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
-    return;
-  }
-
-  sheet.getRange(startRow + 2, startColumn, rows.length, headers.length).setValues(rows);
-  sheet.getRange(startRow, startColumn, rows.length + 2, headers.length)
-    .setBorder(true, true, true, true, true, true, DASHBOARD_COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
-}
-
-function isCurrencyMetric(label) {
-  return [
-    'Total Omzet',
-    'Total LAZISNU',
-    'Total PCNU',
-    'Total Petugas',
-    'Total Pengelola',
-    'Omzet Hari Ini',
-    'LAZISNU Hari Ini',
-    'PCNU Hari Ini',
-    'Petugas Hari Ini',
-    'Pengelola Hari Ini',
-    'Omzet Bulan Ini',
-    'LAZISNU Bulan Ini',
-    'PCNU Bulan Ini',
-    'Petugas Bulan Ini',
-    'Pengelola Bulan Ini'
-  ].includes(label);
-}
-
-function formatDashboardStatistik(sheet) {
-  const lastRow = Math.max(sheet.getLastRow(), 1);
-
-  sheet.setFrozenRows(2);
-  sheet.getRange(1, 1, lastRow, 12)
-    .setWrap(true)
-    .setVerticalAlignment('middle');
-
-  sheet.getRange(1, 1, 1, 12)
-    .setBackground(DASHBOARD_COLORS.emerald)
-    .setFontColor('#ffffff')
-    .setFontWeight('bold')
-    .setFontSize(16)
-    .setHorizontalAlignment('center');
-
-  sheet.getRange(2, 1, 1, 2)
-    .setBackground(DASHBOARD_COLORS.emeraldLight)
-    .setFontWeight('bold')
-    .setBorder(true, true, true, true, true, true, DASHBOARD_COLORS.border, SpreadsheetApp.BorderStyle.SOLID);
-  sheet.getRange(2, 2).setNumberFormat('dd/MM/yyyy HH:mm');
-
-  sheet.getRange(18, 1, Math.max(lastRow - 17, 1), 1).setHorizontalAlignment('center');
-  sheet.getRange(18, 3, Math.max(lastRow - 17, 1), 1).setHorizontalAlignment('center');
-  sheet.getRange(18, 4, Math.max(lastRow - 17, 1), 2).setNumberFormat('Rp #,##0').setHorizontalAlignment('right');
-  sheet.getRange(18, 7, Math.max(lastRow - 17, 1), 1).setHorizontalAlignment('center');
-  sheet.getRange(18, 11, Math.max(lastRow - 17, 1), 1).setNumberFormat('#,##0').setHorizontalAlignment('center');
-  sheet.getRange(18, 12, Math.max(lastRow - 17, 1), 1).setNumberFormat('Rp #,##0').setHorizontalAlignment('right');
-
-  sheet.setRowHeight(1, 36);
-  sheet.autoResizeColumns(1, 12);
-}
-
-function getDataRows(sheet, headers) {
-  if (sheet.getLastRow() <= 1) return [];
-
-  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues();
-  return values.map(valueRow => headers.reduce((acc, header, index) => {
-    acc[header] = valueRow[index];
-    return acc;
-  }, {}));
-}
-
-function formatSheet(sheet) {
-  const lastRow = Math.max(sheet.getLastRow(), 1);
-  const lastColumn = sheet.getLastColumn();
-
-  if (lastColumn === 0) return;
-
-  const headerRange = sheet.getRange(1, 1, 1, lastColumn);
-  headerRange
-    .setFontWeight('bold')
-    .setBackground('#059669')
-    .setFontColor('#ffffff')
-    .setHorizontalAlignment('center');
-
-  sheet.setFrozenRows(1);
-
-  const filter = sheet.getFilter();
-  if (filter) filter.remove();
-  sheet.getRange(1, 1, lastRow, lastColumn).createFilter();
-
-  sheet.getRange(1, 1, lastRow, lastColumn)
-    .setWrap(true)
-    .setBorder(true, true, true, true, true, true, '#d1d5db', SpreadsheetApp.BorderStyle.SOLID);
-
-  applyColumnFormats(sheet);
-  sheet.autoResizeColumns(1, lastColumn);
-}
-
-function applyColumnFormats(sheet) {
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-
-  headers.forEach((header, index) => {
-    const column = index + 1;
-    const range = sheet.getRange(2, column, Math.max(sheet.getLastRow() - 1, 1), 1);
-
-    if (['Tanggal', 'Waktu Sync', 'Terakhir Update'].includes(header)) {
-      range.setNumberFormat('dd/MM/yyyy HH:mm');
-    }
-
-    if (['Harga', 'Subtotal', 'Total Transaksi', 'Total Omzet', 'Rp LAZISNU', 'Rp PCNU', 'Rp Petugas', 'Rp Pengelola'].includes(header)) {
-      range.setNumberFormat('Rp #,##0').setHorizontalAlignment('right');
-    }
-
-    if (['% LAZISNU', '% PCNU', '% Petugas', '% Pengelola'].includes(header)) {
-      range.setNumberFormat('0"%"').setHorizontalAlignment('center');
-    }
-
-    if (['Qty', 'Jumlah Item', 'Total Qty', 'Jumlah Transaksi'].includes(header)) {
-      range.setHorizontalAlignment('center');
-    }
-  });
 }
 
 function jsonResponse(data) {

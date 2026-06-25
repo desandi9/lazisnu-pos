@@ -98,13 +98,18 @@ Aplikasi mendukung URL Google Apps Script default melalui konstanta `DEFAULT_SPR
 
 ## Struktur Google Sheets
 
-Apps Script membuat dan memakai 5 tab di spreadsheet yang sama:
+Apps Script membuat dan merefresh penuh 8 tab Stikernisasi di spreadsheet yang sama:
 
 - `Dashboard Statistik`
-- `Transaksi Detail`
 - `Rekap Transaksi`
+- `Transaksi Detail`
 - `Rekap Laba`
 - `Rekap Petugas`
+- `Piutang`
+- `Uang di Luar`
+- `Stok Barang`
+
+Setiap sync mengganti isi tabel dan dashboard berdasarkan data aplikasi terbaru. Transaksi `paid` masuk omzet/laba/terjual, sedangkan `unpaid` dan `partial` masuk Piutang/Uang di Luar dan tidak dihitung omzet.
 
 ## Supabase Database Phase 1
 

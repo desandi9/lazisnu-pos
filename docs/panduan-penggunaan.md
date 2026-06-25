@@ -59,16 +59,19 @@ Desktop Chrome/Edge:
 - Aplikasi sudah mendukung URL Spreadsheet default, jadi admin tidak perlu mengisi ulang URL di setiap perangkat jika default URL sudah disiapkan pada build aplikasi.
 - Jika ingin memakai spreadsheet lain, isi `Google Apps Script Web App URL`, lalu klik `Simpan URL`.
 - Klik `Reset ke URL Default` untuk menghapus URL custom browser dan kembali memakai endpoint bawaan aplikasi.
-- Klik `Kirim ke Spreadsheet` untuk mengirim transaksi pending.
-- Jika tidak ada transaksi baru, aplikasi akan memberi pesan bahwa tidak ada data yang perlu disinkronkan.
+- Klik `Refresh Spreadsheet` untuk merefresh penuh dashboard dan semua rekap Stikernisasi.
+- Sync tetap bisa dijalankan walaupun tidak ada transaksi pending agar data lama di spreadsheet terganti oleh snapshot terbaru.
 
 ## Membaca Sheet Google Sheets
 
-- `Dashboard Statistik`: ringkasan total, statistik hari ini, statistik bulan ini, top petugas, dan produk terlaris.
-- `Transaksi Detail`: satu baris per item produk. Satu transaksi multi item bisa muncul dalam beberapa baris.
-- `Rekap Transaksi`: satu baris per transaksi berisi total item, total qty, omzet, metode, status sync, dan waktu sync.
-- `Rekap Laba`: satu baris per transaksi berisi pembagian LAZISNU, PCNU, Petugas, dan Pengelola.
-- `Rekap Petugas`: ringkasan per petugas yang ditulis ulang setiap sync agar tidak double count.
+- `Dashboard Statistik`: ringkasan transaksi sukses, omzet, piutang, uang di luar, stok, top petugas, dan produk terlaris.
+- `Rekap Transaksi`: satu baris per transaksi `paid` saja.
+- `Transaksi Detail`: satu baris per item dari transaksi `paid` saja.
+- `Rekap Laba`: pembagian LAZISNU, PCNU, Petugas, dan Pengelola dari transaksi `paid` saja.
+- `Rekap Petugas`: ringkasan per petugas dari transaksi `paid` saja.
+- `Piutang`: transaksi `unpaid` dan `partial` saja.
+- `Uang di Luar`: rekap sisa piutang per produk/pengutang dari transaksi pending.
+- `Stok Barang`: Masuk, Terjual, Piutang, Hilang, dan Sisa.
 
 ## Pembagian Laba
 

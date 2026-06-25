@@ -205,7 +205,6 @@ const getTransactionProductSummary = (tx) => {
 };
 const getTransactionOfficerName = (tx) => tx.namaPetugasSnapshot || '-';
 const getTransactionOfficerRole = (tx) => tx.roleSnapshot || '-';
-const getTransactionProfitPercent = (tx, key) => tx[`${key}PercentSnapshot`] ?? 0;
 const getTransactionProfitAmount = (tx, key) => tx[`${key}Amount`] ?? 0;
 
 // -- Piutang helpers --
@@ -223,6 +222,13 @@ const getPaymentStatusLabel = (tx) => {
   if (status === 'unpaid') return 'Pending / Piutang';
   if (status === 'partial') return 'Pending / Piutang Sebagian';
   return 'Sukses / Lunas';
+};
+const getSpreadsheetPaymentStatusLabel = (tx) => {
+  const status = getPaymentStatus(tx);
+  if (status === 'paid') return 'Lunas';
+  if (status === 'partial') return 'DP / Sebagian';
+
+  return 'Belum Lunas';
 };
 const getPaymentStatusColor = (tx) => {
   const status = getPaymentStatus(tx);
@@ -358,6 +364,7 @@ const buildOutstandingReport = (transactions = []) => {
       byProduct[key].amount += safeItemRemaining;
       byProduct[key].debtors.push({ name: buyerName, amount: safeItemRemaining });
       detailRows.push({
+        invoice: tx.id || tx.transactionNumber || tx.nomorTransaksi || '-',
         productName: item.productNameSnapshot || item.name || '-',
         debtorName: buyerName,
         date: tx.date,
@@ -993,39 +1000,124 @@ class DatabaseService {
     };
   }
 
-  getSpreadsheetRows(transactions, syncedAt) {
-    return transactions.flatMap(tx => getTransactionItems(tx).map(item => ({
-      'No. Transaksi': tx.id,
+  getSpreadsheetSnapshot(syncedAt = new Date().toISOString()) {
+    const transactions = this.getTransactions();
+    const products = this.getProducts();
+    const stockMovements = this.getStikerStockMovements();
+    const paidTransactions = transactions.filter(tx => isPaid(tx));
+    const pendingTransactions = transactions.filter(tx => isUnpaid(tx));
+    const outstandingReport = buildOutstandingReport(pendingTransactions);
+    const stockRows = buildStockReportRows(products, transactions, stockMovements);
+    const transactionRows = paidTransactions.map(tx => ({
       Tanggal: tx.date,
+      Invoice: tx.id,
       Pembeli: tx.buyerName || 'Hamba Allah',
       Petugas: getTransactionOfficerName(tx),
-      Role: getTransactionOfficerRole(tx),
-      Produk: item.productNameSnapshot,
-      Kategori: item.productCategorySnapshot,
-      Ukuran: item.productSizeSnapshot,
-      Qty: item.qty || 0,
-      Harga: item.priceSnapshot || 0,
-      Subtotal: item.subtotal || 0,
-      'Total Transaksi': tx.total || 0,
+      Qty: getTransactionTotalQty(tx),
+      Total: toSafeNumber(tx.total),
       Metode: tx.paymentMethod || '-',
-      Catatan: tx.notes || '',
-      'Status Sync': tx.syncStatus || 'pending',
-      '% LAZISNU': getTransactionProfitPercent(tx, 'lazisnu'),
-      'Rp LAZISNU': getTransactionProfitAmount(tx, 'lazisnu'),
-      '% PCNU': getTransactionProfitPercent(tx, 'pcnu'),
-      'Rp PCNU': getTransactionProfitAmount(tx, 'pcnu'),
-      '% Petugas': getTransactionProfitPercent(tx, 'petugas'),
-      'Rp Petugas': getTransactionProfitAmount(tx, 'petugas'),
-      '% Pengelola': getTransactionProfitPercent(tx, 'pengelola'),
-      'Rp Pengelola': getTransactionProfitAmount(tx, 'pengelola'),
-      'Waktu Sync': syncedAt,
-      // -- Piutang fields --
-      'Status Pembayaran': getPaymentStatusLabel(tx),
-      Terbayar: getPaidAmount(tx),
-      'Sisa Piutang': getRemainingAmount(tx),
-      'Tanggal Lunas': tx.debtPaidAt || '',
-      'Catatan Piutang': tx.debtNote || ''
+      'Status Pembayaran': getSpreadsheetPaymentStatusLabel(tx),
+      LAZISNU: getTransactionProfitAmount(tx, 'lazisnu'),
+      PCNU: getTransactionProfitAmount(tx, 'pcnu'),
+      'Bagian Petugas': getTransactionProfitAmount(tx, 'petugas'),
+      Pengelola: getTransactionProfitAmount(tx, 'pengelola')
+    }));
+    const detailRows = paidTransactions.flatMap(tx => getTransactionItems(tx).map(item => ({
+      Tanggal: tx.date,
+      Invoice: tx.id,
+      Produk: item.productNameSnapshot || '-',
+      Kategori: item.productCategorySnapshot || '-',
+      Ukuran: item.productSizeSnapshot || '-',
+      Qty: toSafeNumber(item.qty),
+      Harga: toSafeNumber(item.priceSnapshot),
+      Subtotal: toSafeNumber(item.subtotal),
+      Pembeli: tx.buyerName || 'Hamba Allah',
+      Petugas: getTransactionOfficerName(tx)
     })));
+    const profitRows = paidTransactions.map(tx => ({
+      Tanggal: tx.date,
+      Invoice: tx.id,
+      Total: toSafeNumber(tx.total),
+      LAZISNU: getTransactionProfitAmount(tx, 'lazisnu'),
+      PCNU: getTransactionProfitAmount(tx, 'pcnu'),
+      Petugas: getTransactionProfitAmount(tx, 'petugas'),
+      Pengelola: getTransactionProfitAmount(tx, 'pengelola')
+    }));
+    const officerRows = Object.values(paidTransactions.reduce((acc, tx) => {
+      const officerName = getTransactionOfficerName(tx);
+
+      if (!acc[officerName]) {
+        acc[officerName] = {
+          Petugas: officerName,
+          'Jumlah Transaksi': 0,
+          'Total Omzet': 0,
+          'Total Qty': 0,
+          'Total Bagian Petugas': 0
+        };
+      }
+
+      acc[officerName]['Jumlah Transaksi'] += 1;
+      acc[officerName]['Total Omzet'] += toSafeNumber(tx.total);
+      acc[officerName]['Total Qty'] += getTransactionTotalQty(tx);
+      acc[officerName]['Total Bagian Petugas'] += getTransactionProfitAmount(tx, 'petugas');
+
+      return acc;
+    }, {})).sort((a, b) => b['Total Omzet'] - a['Total Omzet']);
+    const debtRows = pendingTransactions.flatMap(tx => getTransactionItems(tx).map(item => ({
+      Tanggal: tx.date,
+      Invoice: tx.id,
+      'Nama Pengutang': tx.buyerName || 'Hamba Allah',
+      Produk: item.productNameSnapshot || '-',
+      Qty: toSafeNumber(item.qty),
+      'Total Transaksi': toSafeNumber(tx.total),
+      'Sudah Dibayar': getPaidAmount(tx),
+      'Sisa Piutang': getRemainingAmount(tx),
+      Status: getSpreadsheetPaymentStatusLabel(tx),
+      'Jatuh Tempo': tx.debtDueDate || '',
+      Catatan: tx.debtNote || '',
+      Petugas: getTransactionOfficerName(tx)
+    })));
+    const outstandingRows = outstandingReport.detailRows.map(row => ({
+      Produk: row.productName,
+      'Nama Pengutang': row.debtorName,
+      Invoice: row.invoice,
+      Tanggal: row.date,
+      'Qty Piutang': row.qty,
+      Harga: row.price,
+      Total: row.totalDebt,
+      'Sudah Dibayar': row.paid,
+      Sisa: row.remaining,
+      Status: row.status
+    }));
+    const stockReportRows = stockRows.map(row => ({
+      Produk: row.productName,
+      Masuk: row.in,
+      Terjual: row.sold,
+      Piutang: row.debt,
+      Hilang: row.lost,
+      Sisa: row.remaining
+    }));
+    const rowCount = transactionRows.length + detailRows.length + profitRows.length + officerRows.length + debtRows.length + outstandingRows.length + stockReportRows.length;
+
+    return {
+      module: 'stikernisasi',
+      syncMode: 'fullRefresh',
+      syncedAt,
+      sheets: {
+        rekapTransaksi: transactionRows,
+        transaksiDetail: detailRows,
+        rekapLaba: profitRows,
+        rekapPetugas: officerRows,
+        piutang: debtRows,
+        uangDiLuar: outstandingRows,
+        stokBarang: stockReportRows
+      },
+      summary: {
+        totalTransactions: paidTransactions.length,
+        pendingTransactions: pendingTransactions.length,
+        rowCount
+      }
+    };
   }
 
   async syncToSpreadsheet(webAppUrl) {
@@ -1043,22 +1135,13 @@ class DatabaseService {
       throw new Error('URL Google Apps Script tidak valid. Periksa kembali URL Web App yang ditempel.', { cause: error });
     }
 
-    const transactions = this.getTransactions();
-    const pendingTransactions = transactions.filter(tx => tx.syncStatus === 'pending');
-
-    if (pendingTransactions.length === 0) {
-      return { success: true, message: 'Tidak ada transaksi baru untuk disinkronkan.', count: 0, rows: 0 };
-    }
-
     const now = new Date().toISOString();
-    const rowsToSync = this.getSpreadsheetRows(pendingTransactions, now);
-
-    if (rowsToSync.length === 0) throw new Error('Tidak ada data transaksi yang bisa dikirim.');
+    const snapshot = this.getSpreadsheetSnapshot(now);
 
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
-        body: JSON.stringify({ rows: rowsToSync })
+        body: JSON.stringify(snapshot)
       });
 
       const responseText = await response.text();
@@ -1076,11 +1159,13 @@ class DatabaseService {
 
       if (!result.success) throw new Error(result.message || 'Apps Script mengembalikan status gagal. Periksa log Apps Script.');
 
+      const transactions = this.getTransactions();
+      const pendingTransactions = transactions.filter(tx => tx.syncStatus === 'pending');
       const pendingIds = new Set(pendingTransactions.map(tx => tx.id));
       const updatedTransactions = transactions.map(tx => pendingIds.has(tx.id) ? { ...tx, syncStatus: 'synced', syncedAt: now } : tx);
 
       this._set('transactions', updatedTransactions);
-      return { success: true, message: `${pendingTransactions.length} transaksi berhasil ditambahkan ke Spreadsheet.`, count: pendingTransactions.length, rows: rowsToSync.length, syncedAt: now };
+      return { success: true, message: `Spreadsheet berhasil direfresh penuh. ${pendingTransactions.length} transaksi pending ditandai synced.`, count: pendingTransactions.length, rows: snapshot.summary.rowCount, syncedAt: now };
     } catch (error) {
       if (error instanceof TypeError) {
         throw new Error('Gagal menghubungi Spreadsheet. Periksa URL atau koneksi internet.', { cause: error });
@@ -5150,48 +5235,50 @@ const SpreadsheetView = ({ showToast }) => {
       let res;
 
       if (health.status === 'connected') {
-        const { pendingTransactions } = await checkPending();
-        if (pendingTransactions.length === 0) {
-          res = { success: true, message: 'Tidak ada transaksi baru untuk disinkronkan.', count: 0, rows: 0, syncedAt: new Date().toISOString() };
-        } else {
-          const endpoint = webAppUrl.trim();
-          const parsedUrl = new URL(endpoint);
-          if (!['http:', 'https:'].includes(parsedUrl.protocol) || !parsedUrl.pathname.endsWith('/exec')) {
-            throw new Error('URL Google Apps Script tidak valid. Pastikan memakai URL Web App yang diakhiri /exec.');
-          }
-
-          const now = new Date().toISOString();
-          const rowsToSync = db.getSpreadsheetRows(pendingTransactions, now);
-          if (rowsToSync.length === 0) throw new Error('Tidak ada data transaksi yang bisa dikirim.');
-
-          const response = await fetch(endpoint, {
-            method: 'POST',
-            body: JSON.stringify({ rows: rowsToSync })
-          });
-          const responseText = await response.text();
-          if (!response.ok) throw new Error('Apps Script gagal memproses data. Periksa deployment Web App dan izin aksesnya.');
-
-          let sheetResult;
-          try {
-            sheetResult = JSON.parse(responseText);
-          } catch (error) {
-            throw new Error('Response Spreadsheet tidak valid. Pastikan URL Web App Apps Script benar.', { cause: error });
-          }
-
-          if (!sheetResult.success) throw new Error(sheetResult.message || 'Apps Script mengembalikan status gagal. Periksa log Apps Script.');
-
-          const statusResults = await Promise.all(pendingTransactions.map(tx => updateTransactionSyncStatusInDb(tx.dbId || tx.id, 'synced', now)));
-          if (statusResults.some(result => !result.success)) throw new Error('Spreadsheet berhasil diupdate, tetapi status sync database gagal diperbarui.');
-
-          await syncTransactionsCacheFromDb();
-          res = { success: true, message: `${pendingTransactions.length} transaksi berhasil ditambahkan ke Spreadsheet.`, count: pendingTransactions.length, rows: rowsToSync.length, syncedAt: now };
+        const endpoint = webAppUrl.trim();
+        const parsedUrl = new URL(endpoint);
+        if (!['http:', 'https:'].includes(parsedUrl.protocol) || !parsedUrl.pathname.endsWith('/exec')) {
+          throw new Error('URL Google Apps Script tidak valid. Pastikan memakai URL Web App yang diakhiri /exec.');
         }
+
+        const now = new Date().toISOString();
+        const [transactionResult, productResult, movementResult] = await Promise.all([
+          refreshTransactionsCacheWithFallback(),
+          syncProductsCacheFromDb(),
+          syncStikerStockMovementsCacheFromDb()
+        ]);
+        if (!productResult.success) throw new Error('Gagal membaca data produk untuk sync spreadsheet.');
+        if (!movementResult.success) throw new Error('Gagal membaca data stok barang untuk sync spreadsheet.');
+
+        const snapshot = db.getSpreadsheetSnapshot(now);
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          body: JSON.stringify(snapshot)
+        });
+        const responseText = await response.text();
+        if (!response.ok) throw new Error('Apps Script gagal memproses data. Periksa deployment Web App dan izin aksesnya.');
+
+        let sheetResult;
+        try {
+          sheetResult = JSON.parse(responseText);
+        } catch (error) {
+          throw new Error('Response Spreadsheet tidak valid. Pastikan URL Web App Apps Script benar.', { cause: error });
+        }
+
+        if (!sheetResult.success) throw new Error(sheetResult.message || 'Apps Script mengembalikan status gagal. Periksa log Apps Script.');
+
+        const pendingTransactions = transactionResult.data.filter(tx => tx.syncStatus === 'pending');
+        const statusResults = await Promise.all(pendingTransactions.map(tx => updateTransactionSyncStatusInDb(tx.dbId || tx.id, 'synced', now)));
+        if (statusResults.some(result => !result.success)) throw new Error('Spreadsheet berhasil direfresh, tetapi status sync database gagal diperbarui.');
+
+        await syncTransactionsCacheFromDb();
+        res = { success: true, message: `Spreadsheet berhasil direfresh penuh. ${pendingTransactions.length} transaksi pending ditandai synced.`, count: pendingTransactions.length, rows: snapshot.summary.rowCount, syncedAt: now };
       } else {
         res = await db.syncToSpreadsheet(webAppUrl);
       }
 
       showToast(res.message, 'success');
-      setLastStatus(`${res.rows || 0} baris berhasil ditambahkan ke spreadsheet.`);
+      setLastStatus(`${res.rows || 0} baris aktif berhasil direfresh ke spreadsheet.`);
       setLastSync(res.syncedAt);
       if (res.syncedAt) localStorage.setItem('lazisnu_last_sync_core', res.syncedAt);
       await checkPending();
@@ -5228,8 +5315,8 @@ const SpreadsheetView = ({ showToast }) => {
           </div>
         </div>
 
-        <Button onClick={handleSync} isLoading={isSubmitting} disabled={pendingCount === 0 || isSubmitting} className={`w-full py-4 text-base rounded-2xl ${pendingCount > 0 ? 'bg-blue-600 text-white hover:bg-blue-700 shadow-blue-600/30 shadow-lg' : 'bg-slate-100 text-slate-400 shadow-none dark:bg-slate-800 dark:text-slate-500'}`}>
-          {isSubmitting ? 'Proses Sinkronisasi...' : 'Kirim ke Spreadsheet'}
+        <Button onClick={handleSync} isLoading={isSubmitting} disabled={isSubmitting} className="w-full py-4 text-base rounded-2xl bg-blue-600 text-white hover:bg-blue-700 shadow-blue-600/30 shadow-lg disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none dark:disabled:bg-slate-800 dark:disabled:text-slate-500">
+          {isSubmitting ? 'Proses Sinkronisasi...' : 'Refresh Spreadsheet'}
         </Button>
 
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-[#0a0f1c] p-4 md:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -5297,7 +5384,7 @@ const SpreadsheetView = ({ showToast }) => {
           <span className="text-center text-sm font-bold text-slate-600 dark:text-slate-400 bg-slate-50 dark:bg-slate-800 px-4 py-2 rounded-lg max-w-full break-words">Status: {lastStatus}</span>
           <div className="flex items-start gap-3 bg-blue-50/50 dark:bg-blue-900/10 p-4 rounded-xl border border-blue-100/50 dark:border-blue-800/50 text-left mt-4 text-xs md:text-sm text-slate-600 dark:text-slate-400 leading-relaxed w-full">
             <Info size={20} className="text-blue-500 shrink-0 mt-0.5" />
-            <p>Data akan ditambahkan ke spreadsheet yang sama dan meneruskan baris sebelumnya. Hanya transaksi berstatus <span className="font-extrabold text-slate-800 dark:text-slate-200">pending</span> yang dikirim, lalu berubah menjadi <span className="font-extrabold text-slate-800 dark:text-slate-200">synced</span> setelah sukses.</p>
+            <p>Sync akan merefresh penuh sheet Stikernisasi: dashboard, transaksi sukses, laba, piutang, uang di luar, dan stok barang. Transaksi piutang tidak dihitung omzet; transaksi pending yang sudah terkirim akan ditandai <span className="font-extrabold text-slate-800 dark:text-slate-200">synced</span> setelah sukses.</p>
           </div>
         </div>
       </Card>
