@@ -41,8 +41,13 @@ import {
 import {
   createTransactionInDb,
   syncTransactionsCacheFromDb,
+  updateTransactionInDb,
   updateTransactionSyncStatusInDb
 } from './services/database/dbTransactionService';
+import {
+  createStikerStockMovementInDb,
+  syncStikerStockMovementsCacheFromDb
+} from './services/database/dbStikerStockMovementService';
 import {
   syncProfitSharingSettingsCacheFromDb,
   upsertProfitSharingSettingsToDb
@@ -51,7 +56,8 @@ import {
   User, ArrowRight, LayoutDashboard, 
   Package, ShoppingCart, FileText, Database, 
   LogOut, Plus, Edit2, Trash2, AlertTriangle, CheckCircle2, 
-  Printer, X, Menu, RefreshCcw, Info, Sun, Moon, Receipt, PieChart, Download, Settings, Eye, EyeOff
+  Printer, X, Menu, RefreshCcw, Info, Sun, Moon, Receipt, PieChart, Download, Settings, Eye, EyeOff,
+  BadgeDollarSign
 } from 'lucide-react';
 
 // ============================================================================
@@ -202,6 +208,188 @@ const getTransactionOfficerRole = (tx) => tx.roleSnapshot || '-';
 const getTransactionProfitPercent = (tx, key) => tx[`${key}PercentSnapshot`] ?? 0;
 const getTransactionProfitAmount = (tx, key) => tx[`${key}Amount`] ?? 0;
 
+// -- Piutang helpers --
+const getPaymentStatus = (tx) => tx.paymentStatus || 'paid';
+const getPaymentStatusLabel = (tx) => {
+  const status = getPaymentStatus(tx);
+  if (status === 'paid') return 'Lunas';
+  if (status === 'unpaid') return 'Belum Lunas';
+  if (status === 'partial') return 'Sebagian';
+  return 'Lunas';
+};
+const getPaymentStatusColor = (tx) => {
+  const status = getPaymentStatus(tx);
+  if (status === 'paid') return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400';
+  if (status === 'unpaid') return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
+  return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400';
+};
+const getPaidAmount = (tx) => Number(tx.paidAmount ?? (getPaymentStatus(tx) === 'paid' ? tx.total : 0) ?? 0);
+const getRemainingAmount = (tx) => {
+  if (tx.remainingAmount !== undefined && tx.remainingAmount !== null) return Number(tx.remainingAmount || 0);
+  if (getPaymentStatus(tx) === 'paid') return 0;
+
+  return Math.max(0, Number(tx.total || 0) - getPaidAmount(tx));
+};
+const isPaid = (tx) => getPaymentStatus(tx) === 'paid';
+const isUnpaid = (tx) => getPaymentStatus(tx) === 'unpaid' || getPaymentStatus(tx) === 'partial';
+const toSafeNumber = (value) => {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
+};
+const getNormalizedKey = (value) => String(value || '').trim().toLowerCase();
+const getProductReportKey = (product) => product?.id || product?.localId || getNormalizedKey(product?.name) || `product-${Math.random()}`;
+const getItemReportKey = (item) => item.productId || item.product_id || getNormalizedKey(item.productNameSnapshot || item.product_name_snapshot || item.name);
+const findStockReportRow = (rowsByKey, products, item) => {
+  const itemProductId = item.productId || item.product_id || null;
+  const itemName = getNormalizedKey(item.productNameSnapshot || item.product_name_snapshot || item.name);
+  const matchedProduct = products.find(product => (
+    product.id === itemProductId
+    || product.localId === itemProductId
+    || getNormalizedKey(product.name) === itemName
+  ));
+  const key = matchedProduct ? getProductReportKey(matchedProduct) : (itemProductId || itemName || 'unknown-product');
+
+  if (!rowsByKey[key]) {
+    rowsByKey[key] = {
+      key,
+      productId: matchedProduct?.id || itemProductId || null,
+      productName: matchedProduct?.name || item.productNameSnapshot || item.name || '-',
+      currentStock: toSafeNumber(matchedProduct?.stock),
+      in: 0,
+      sold: 0,
+      debt: 0,
+      lost: 0,
+      remaining: 0
+    };
+  }
+
+  return rowsByKey[key];
+};
+const buildStockReportRows = (products = [], transactions = [], movements = []) => {
+  const rowsByKey = sortProductsByCategory(products).reduce((acc, product) => {
+    const key = getProductReportKey(product);
+
+    acc[key] = {
+      key,
+      productId: product.id,
+      productName: product.name || '-',
+      currentStock: toSafeNumber(product.stock),
+      in: 0,
+      sold: 0,
+      debt: 0,
+      lost: 0,
+      remaining: 0
+    };
+
+    return acc;
+  }, {});
+
+  transactions.forEach(tx => {
+    getTransactionItems(tx).forEach(item => {
+      const row = findStockReportRow(rowsByKey, products, item);
+      const qty = toSafeNumber(item.qty);
+
+      if (isUnpaid(tx)) row.debt += qty;
+      else row.sold += qty;
+    });
+  });
+
+  movements.forEach(movement => {
+    const product = products.find(item => item.id === movement.productId || item.localId === movement.productId);
+    if (!product) return;
+
+    const key = getProductReportKey(product);
+    if (!rowsByKey[key]) return;
+
+    if (movement.type === 'in') rowsByKey[key].in += toSafeNumber(movement.qty);
+    if (movement.type === 'lost') rowsByKey[key].lost += toSafeNumber(movement.qty);
+  });
+
+  return Object.values(rowsByKey).map(row => {
+    const fallbackIn = row.currentStock + row.sold + row.debt + row.lost;
+    const masuk = row.in > 0 ? Math.max(row.in, fallbackIn) : fallbackIn;
+    const remaining = masuk - row.sold - row.debt - row.lost;
+
+    return {
+      ...row,
+      in: masuk,
+      remaining
+    };
+  }).sort((a, b) => a.productName.localeCompare(b.productName, 'id-ID', { sensitivity: 'base' }));
+};
+const buildOutstandingReport = (transactions = []) => {
+  const unpaidTransactions = transactions.filter(tx => isUnpaid(tx));
+  const byProduct = {};
+  const detailRows = [];
+  const debtorNames = new Set();
+
+  unpaidTransactions.forEach(tx => {
+    const items = getTransactionItems(tx);
+    const txTotal = toSafeNumber(tx.total) || items.reduce((sum, item) => sum + toSafeNumber(item.subtotal), 0);
+    const remainingAmount = toSafeNumber(getRemainingAmount(tx));
+    const buyerName = tx.buyerName || 'Hamba Allah';
+
+    debtorNames.add(buyerName);
+
+    items.forEach(item => {
+      const subtotal = toSafeNumber(item.subtotal) || (toSafeNumber(item.priceSnapshot) * toSafeNumber(item.qty));
+      const itemRemaining = getPaymentStatus(tx) === 'unpaid'
+        ? subtotal
+        : (txTotal > 0 ? Math.round((subtotal / txTotal) * remainingAmount) : Math.round(remainingAmount / Math.max(items.length, 1)));
+      const safeItemRemaining = Math.max(0, Math.min(subtotal || remainingAmount, itemRemaining));
+      const key = getItemReportKey(item) || getNormalizedKey(item.productNameSnapshot);
+
+      if (!byProduct[key]) {
+        byProduct[key] = {
+          key,
+          productName: item.productNameSnapshot || item.name || '-',
+          qty: 0,
+          amount: 0,
+          debtors: []
+        };
+      }
+
+      byProduct[key].qty += toSafeNumber(item.qty);
+      byProduct[key].amount += safeItemRemaining;
+      byProduct[key].debtors.push({ name: buyerName, amount: safeItemRemaining });
+      detailRows.push({
+        productName: item.productNameSnapshot || item.name || '-',
+        debtorName: buyerName,
+        date: tx.date,
+        qty: toSafeNumber(item.qty),
+        price: toSafeNumber(item.priceSnapshot),
+        totalDebt: subtotal,
+        paid: Math.max(0, subtotal - safeItemRemaining),
+        remaining: safeItemRemaining,
+        status: getPaymentStatusLabel(tx)
+      });
+    });
+  });
+
+  const productRows = Object.values(byProduct).map(row => {
+    const debtorMap = row.debtors.reduce((acc, debtor) => {
+      acc[debtor.name] = (acc[debtor.name] || 0) + debtor.amount;
+      return acc;
+    }, {});
+
+    return {
+      ...row,
+      debtors: Object.entries(debtorMap).map(([name, amount]) => ({ name, amount }))
+    };
+  }).sort((a, b) => a.productName.localeCompare(b.productName, 'id-ID', { sensitivity: 'base' }));
+
+  return {
+    summary: {
+      totalAmount: unpaidTransactions.reduce((sum, tx) => sum + toSafeNumber(getRemainingAmount(tx)), 0),
+      transactionCount: unpaidTransactions.length,
+      totalQty: unpaidTransactions.reduce((sum, tx) => sum + getTransactionTotalQty(tx), 0),
+      debtorCount: debtorNames.size
+    },
+    productRows,
+    detailRows
+  };
+};
+
 const calculateProfitSharing = (total, settings) => ({
   lazisnuPercentSnapshot: settings.lazisnuPercent,
   pcnuPercentSnapshot: settings.pcnuPercent,
@@ -234,6 +422,7 @@ const normalizeLpnuProductFinance = (product = {}) => ({
 
 const calculateLpnuTotals = (items, biayaOperasional = 0) => {
   const totalQty = items.reduce((sum, item) => sum + Number(item.qty || 0), 0);
+  const totalModal = items.reduce((sum, item) => sum + Number(item.subtotalModal || 0), 0);
   const totalJual = items.reduce((sum, item) => sum + Number(item.subtotalJual || 0), 0);
   const supplierAmount = items.reduce((sum, item) => sum + Number(item.supplierAmount || 0), 0);
   const lpnuAmount = items.reduce((sum, item) => sum + Number(item.lpnuAmount || 0), 0);
@@ -246,11 +435,11 @@ const calculateLpnuTotals = (items, biayaOperasional = 0) => {
 
   return {
     totalQty,
-    totalModal: supplierAmount,
+    totalModal,
     totalJual,
-    labaKotor: totalJual - supplierAmount,
+    labaKotor: totalJual - totalModal,
     biayaOperasional: biaya,
-    labaBersih: totalJual - supplierAmount - biaya,
+    labaBersih: totalJual - totalModal - biaya,
     supplierAmount,
     lpnuAmount,
     pcnuAmount,
@@ -562,6 +751,10 @@ class DatabaseService {
     const profitSharing = calculateProfitSharing(total, this.getProfitSharingSettings());
     const firstItem = items[0];
 
+    const paymentStatus = txData.paymentStatus === 'unpaid' ? 'unpaid' : 'paid';
+    const paidAmount = paymentStatus === 'paid' ? total : 0;
+    const remainingAmount = paymentStatus === 'paid' ? 0 : total;
+
     return {
       id: `TX-${Date.now()}`,
       date: new Date().toISOString(),
@@ -587,7 +780,14 @@ class DatabaseService {
       notes: txData.notes || '',
       ...profitSharing,
       syncStatus: 'pending',
-      syncedAt: null
+      syncedAt: null,
+      // -- Piutang fields --
+      paymentStatus,
+      paidAmount,
+      remainingAmount,
+      debtDueDate: paymentStatus === 'unpaid' ? (txData.debtDueDate || null) : null,
+      debtPaidAt: paymentStatus === 'paid' ? new Date().toISOString() : null,
+      debtNote: paymentStatus === 'unpaid' ? (txData.debtNote || null) : null
     };
   }
 
@@ -643,6 +843,10 @@ class DatabaseService {
     const profitSharing = calculateProfitSharing(total, this.getProfitSharingSettings());
     const firstItem = items[0];
 
+    const paymentStatus = txData.paymentStatus === 'unpaid' ? 'unpaid' : 'paid';
+    const paidAmount = paymentStatus === 'paid' ? total : 0;
+    const remainingAmount = paymentStatus === 'paid' ? 0 : total;
+
     const newTx = {
       id: `TX-${Date.now()}`,
       date: new Date().toISOString(),
@@ -668,7 +872,14 @@ class DatabaseService {
       notes: txData.notes || '',
       ...profitSharing,
       syncStatus: 'pending',
-      syncedAt: null
+      syncedAt: null,
+      // -- Piutang fields --
+      paymentStatus,
+      paidAmount,
+      remainingAmount,
+      debtDueDate: paymentStatus === 'unpaid' ? (txData.debtDueDate || null) : null,
+      debtPaidAt: paymentStatus === 'paid' ? new Date().toISOString() : null,
+      debtNote: paymentStatus === 'unpaid' ? (txData.debtNote || null) : null
     };
     
     const transactions = this.getTransactions();
@@ -680,6 +891,53 @@ class DatabaseService {
 
   getPendingSyncs() {
     return this.getTransactions().filter(t => t.syncStatus === 'pending');
+  }
+
+  updateTransactionPaymentStatus(txId, payload) {
+    const transactions = this.getTransactions();
+    const index = transactions.findIndex(tx => tx.id === txId);
+    if (index === -1) throw new Error('Transaksi tidak ditemukan.');
+
+    transactions[index] = { ...transactions[index], ...payload, updatedAt: new Date().toISOString() };
+    this._set('transactions', transactions);
+    return transactions[index];
+  }
+
+  markTransactionAsPaid(txId) {
+    const transactions = this.getTransactions();
+    const tx = transactions.find(t => t.id === txId);
+    if (!tx) throw new Error('Transaksi tidak ditemukan.');
+
+    const now = new Date().toISOString();
+    return this.updateTransactionPaymentStatus(txId, {
+      paymentStatus: 'paid',
+      paidAmount: tx.total,
+      remainingAmount: 0,
+      debtPaidAt: now
+    });
+  }
+
+  markTransactionAsPartialPaid(txId, amount) {
+    const transactions = this.getTransactions();
+    const tx = transactions.find(t => t.id === txId);
+    if (!tx) throw new Error('Transaksi tidak ditemukan.');
+    if (amount <= 0) throw new Error('Nominal pembayaran harus lebih dari 0.');
+
+    const newPaidAmount = (tx.paidAmount || 0) + amount;
+    if (newPaidAmount >= tx.total) {
+      return this.updateTransactionPaymentStatus(txId, {
+        paymentStatus: 'paid',
+        paidAmount: tx.total,
+        remainingAmount: 0,
+        debtPaidAt: new Date().toISOString()
+      });
+    }
+
+    return this.updateTransactionPaymentStatus(txId, {
+      paymentStatus: 'partial',
+      paidAmount: newPaidAmount,
+      remainingAmount: tx.total - newPaidAmount
+    });
   }
 
   getSpreadsheetUrl() {
@@ -738,7 +996,13 @@ class DatabaseService {
       'Rp Petugas': getTransactionProfitAmount(tx, 'petugas'),
       '% Pengelola': getTransactionProfitPercent(tx, 'pengelola'),
       'Rp Pengelola': getTransactionProfitAmount(tx, 'pengelola'),
-      'Waktu Sync': syncedAt
+      'Waktu Sync': syncedAt,
+      // -- Piutang fields --
+      'Status Pembayaran': tx.paymentStatus === 'paid' ? 'Lunas' : (tx.paymentStatus === 'unpaid' ? 'Belum Lunas' : 'Sebagian'),
+      Terbayar: tx.paidAmount || 0,
+      'Sisa Piutang': tx.remainingAmount || 0,
+      'Tanggal Lunas': tx.debtPaidAt || '',
+      'Catatan Piutang': tx.debtNote || ''
     })));
   }
 
@@ -802,6 +1066,49 @@ class DatabaseService {
 
       throw error;
     }
+  }
+
+  getStikerStockMovements() { return this._get('stikerStockMovements'); }
+
+  saveStikerStockMovement(movement) {
+    const movements = this.getStikerStockMovements();
+    const now = new Date().toISOString();
+    const nextMovement = {
+      id: movement.id || `SM-${Date.now()}`,
+      productId: movement.productId,
+      type: movement.type,
+      qty: Math.max(0, Number(movement.qty || 0)),
+      note: movement.note || '',
+      createdBy: movement.createdBy || null,
+      createdByName: movement.createdByName || '',
+      createdAt: movement.createdAt || now
+    };
+
+    this._set('stikerStockMovements', [nextMovement, ...movements]);
+    return nextMovement;
+  }
+
+  applyStikerStockMovement(movement) {
+    const products = this.getProducts();
+    const productIndex = products.findIndex(product => product.id === movement.productId || product.localId === movement.productId);
+    if (productIndex === -1) throw new Error('Produk tidak ditemukan.');
+
+    const qty = Math.max(0, Number(movement.qty || 0));
+    if (qty < 1) throw new Error('Qty harus lebih dari 0.');
+
+    if (movement.type === 'lost') {
+      products[productIndex].stock = Math.max(0, Number(products[productIndex].stock || 0) - qty);
+      if (products[productIndex].stock <= 0) products[productIndex].isActive = false;
+    } else if (movement.type === 'in') {
+      products[productIndex].stock = Math.max(0, Number(products[productIndex].stock || 0) + qty);
+      if (products[productIndex].stock > 0) products[productIndex].isActive = true;
+    } else {
+      throw new Error('Tipe movement stok tidak valid.');
+    }
+
+    products[productIndex].updatedAt = new Date().toISOString();
+    this._set('products', products);
+    return this.saveStikerStockMovement(movement);
   }
 
   getLpnuProducts() { return this._get('lpnuProducts'); }
@@ -2018,10 +2325,11 @@ const LpnuProductsView = ({ showToast }) => {
 
 const LpnuSalesView = ({ showToast }) => {
   const { user } = useContext(AppContext);
-  const [products, setProducts] = useState(() => sortLpnuProducts(db.getLpnuProducts().filter(product => product.isActive && product.stock > 0)));
+  const [products, setProducts] = useState([]);
   const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, biayaOperasional: 0, paymentMethod: 'Tunai', notes: '' });
   const [cartItems, setCartItems] = useState([]);
   const [transactions, setTransactions] = useState(() => db.getLpnuTransactions());
+  const [productSource, setProductSource] = useState('Memuat');
   const [transactionSource, setTransactionSource] = useState('Lokal');
   const [isSubmittingTransaction, setIsSubmittingTransaction] = useState(false);
   const [selectedReceipt, setSelectedReceipt] = useState(null);
@@ -2033,17 +2341,20 @@ const LpnuSalesView = ({ showToast }) => {
     let isMounted = true;
 
     queueMicrotask(async () => {
+      const health = await checkDatabaseConnection();
       const [productResult, transactionResult] = await Promise.all([
         syncLpnuProductsCacheFromDb(),
         syncLpnuTransactionsCacheFromDb()
       ]);
-      const sourceProducts = productResult.success ? productResult.data : db.getLpnuProducts();
+      const sourceProducts = productResult.success || health.status !== 'connected' ? (productResult.success ? productResult.data : db.getLpnuProducts()) : [];
       const sourceTransactions = transactionResult.success ? transactionResult.data : db.getLpnuTransactions();
 
       if (!isMounted) return;
       setProducts(sortLpnuProducts(sourceProducts.filter(product => product.isActive && product.stock > 0)));
       setTransactions(sourceTransactions);
+      setProductSource(productResult.success ? 'Database' : 'Lokal');
       setTransactionSource(transactionResult.success ? 'Database' : 'Lokal');
+      if (health.status === 'connected' && !productResult.success) console.error('LPNU products load failed for sales dropdown', productResult.error);
     });
 
     return () => {
@@ -2066,15 +2377,15 @@ const LpnuSalesView = ({ showToast }) => {
     if (nextQty > selectedProduct.stock) return showToast('Stok tidak mencukupi.', 'error');
 
     const financeProduct = normalizeLpnuProductFinance(selectedProduct);
-    const costPriceSnapshot = Number(financeProduct.costPrice || 0);
-    const sellingPriceSnapshot = Number(financeProduct.sellingPrice || 0);
+    const costPriceSnapshot = Number(selectedProduct.costPrice || 0);
+    const sellingPriceSnapshot = Number(selectedProduct.sellingPrice || 0);
     const supplierShareSnapshot = Number(financeProduct.supplierShare || 0);
     const lpnuShareSnapshot = Number(financeProduct.lpnuShare || 0);
     const pcnuShareSnapshot = Number(financeProduct.pcnuShare || 0);
     const lazisnuShareSnapshot = Number(financeProduct.lazisnuShare || 0);
-    const lazisnuInfaqPercentSnapshot = Number(financeProduct.lazisnuInfaqPercent || 0);
+    const lazisnuInfaqPercentSnapshot = Number(financeProduct.lazisnuInfaqPercent || 50);
     const buildCartItem = (qty) => {
-      const subtotalModal = supplierShareSnapshot * qty;
+      const subtotalModal = costPriceSnapshot * qty;
       const subtotalJual = sellingPriceSnapshot * qty;
       const supplierAmount = supplierShareSnapshot * qty;
       const lpnuAmount = lpnuShareSnapshot * qty;
@@ -2086,7 +2397,7 @@ const LpnuSalesView = ({ showToast }) => {
       return {
         productId: selectedProduct.id,
         productNameSnapshot: selectedProduct.name,
-        categorySnapshot: selectedProduct.category || '-',
+        categorySnapshot: selectedProduct.category || 'LPNU',
         unitSnapshot: selectedProduct.unit || '-',
         costPriceSnapshot,
         sellingPriceSnapshot,
@@ -2159,8 +2470,7 @@ const LpnuSalesView = ({ showToast }) => {
 
     return Object.entries(requestedQtyByProduct).map(([productId, qty]) => {
       const product = sourceProducts.find(item => item.id === productId);
-      if (!product) throw new Error('Produk LPNU tidak ditemukan di database. Muat ulang produk lalu coba lagi.');
-      if (!isLpnuProductDbId(product.id)) throw new Error('Produk LPNU belum tersimpan di database. Simpan produk ke Supabase terlebih dahulu.');
+      if (!product || !isLpnuProductDbId(product.id)) throw new Error('Produk LPNU tidak ditemukan di database. Refresh data produk lalu coba lagi.');
       if (Number(product.stock || 0) < qty) throw new Error(`Stok ${product.name} tidak mencukupi.`);
 
       return { product, qty, nextStock: Number(product.stock || 0) - qty };
@@ -2168,15 +2478,17 @@ const LpnuSalesView = ({ showToast }) => {
   };
 
   const refreshLpnuSalesData = async () => {
+    const health = await checkDatabaseConnection();
     const [productResult, transactionResult] = await Promise.all([
       syncLpnuProductsCacheFromDb(),
       syncLpnuTransactionsCacheFromDb()
     ]);
-    const sourceProducts = productResult.success ? productResult.data : db.getLpnuProducts();
+    const sourceProducts = productResult.success || health.status !== 'connected' ? (productResult.success ? productResult.data : db.getLpnuProducts()) : [];
     const sourceTransactions = transactionResult.success ? transactionResult.data : db.getLpnuTransactions();
 
     setProducts(sortLpnuProducts(sourceProducts.filter(product => product.isActive && product.stock > 0)));
     setTransactions(sourceTransactions);
+    setProductSource(productResult.success ? 'Database' : 'Lokal');
     setTransactionSource(transactionResult.success ? 'Database' : 'Lokal');
 
     return { sourceProducts, sourceTransactions };
@@ -2188,26 +2500,43 @@ const LpnuSalesView = ({ showToast }) => {
     if (cartItems.length === 0) return showToast('Keranjang transaksi masih kosong.', 'error');
 
     setIsSubmittingTransaction(true);
+    let healthStatus = 'unknown';
     try {
       const health = await checkDatabaseConnection();
+      healthStatus = health.status;
       let tx;
 
       if (health.status === 'connected') {
-        const productResult = await syncLpnuProductsCacheFromDb();
+        let productResult = await syncLpnuProductsCacheFromDb();
         if (!productResult.success) throw new Error('Gagal menyimpan transaksi LPNU ke database.');
 
-        const stockUpdates = validateLpnuStockForTransaction(productResult.data);
+        let stockUpdates;
+        try {
+          stockUpdates = validateLpnuStockForTransaction(productResult.data);
+        } catch (validationError) {
+          console.warn('LPNU product validation retry', {
+            message: validationError.message,
+            cartItems,
+            productIds: cartItems.map(item => item.productId),
+            productSource,
+            databaseStatus: health.status,
+            fetchedProducts: productResult.data
+          });
+          productResult = await syncLpnuProductsCacheFromDb();
+          if (!productResult.success) throw new Error('Produk LPNU tidak ditemukan di database. Refresh data produk lalu coba lagi.', { cause: validationError });
+          stockUpdates = validateLpnuStockForTransaction(productResult.data);
+        }
         const transactionPayload = await buildTransactionPayload();
         const result = await createLpnuTransactionInDb(transactionPayload);
         if (!result.success) {
-          console.error('LPNU transaction insert failed', { error: result.error, transactionPayload });
+          console.error('LPNU transaction insert failed', { error: result.error, transactionPayload, selectedProduct, cartItems, productIds: cartItems.map(item => item.productId), productSource, databaseStatus: health.status });
           throw new Error('Gagal menyimpan transaksi LPNU ke database.');
         }
 
         for (const stockUpdate of stockUpdates) {
           const stockResult = await updateLpnuProductStockInDb(stockUpdate.product.id, stockUpdate.nextStock);
           if (!stockResult.success) {
-            console.error('LPNU product stock update failed after transaction', { error: stockResult.error, stockUpdate });
+            console.error('LPNU product stock update failed after transaction', { error: stockResult.error, stockUpdate, selectedProduct, cartItems, productIds: cartItems.map(item => item.productId), productSource, databaseStatus: health.status });
             throw new Error('Gagal menyimpan transaksi LPNU ke database.');
           }
         }
@@ -2228,6 +2557,7 @@ const LpnuSalesView = ({ showToast }) => {
       setSelectedReceipt(tx);
       showToast(`Transaksi LPNU tersimpan: ${tx.transactionNumber}`);
     } catch (error) {
+      console.error('LPNU transaction save failed', { error: error.message || error, selectedProduct, cartItems, productIds: cartItems.map(item => item.productId), productSource, transactionSource, databaseStatus: healthStatus });
       showToast(error.message, 'error');
     } finally {
       setIsSubmittingTransaction(false);
@@ -2236,7 +2566,7 @@ const LpnuSalesView = ({ showToast }) => {
 
   return (
     <div className="space-y-6 md:space-y-8 animate-fade-in max-w-4xl mx-auto pt-2 md:pt-4">
-      <header className="text-center px-1 md:px-0"><h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Penjualan LPNU</h1><p className="text-slate-500 mt-1.5 text-sm md:text-base">Catat transaksi produk LPNU dengan tampilan input yang ringkas.</p></header>
+      <header className="text-center px-1 md:px-0"><h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Penjualan LPNU</h1><p className="text-slate-500 mt-1.5 text-sm md:text-base">Catat transaksi produk LPNU dengan tampilan input yang ringkas.</p><p className="text-xs font-bold text-blue-600 dark:text-blue-400 mt-2">Sumber Produk: {productSource}</p></header>
       <Card className="shadow-lg border-slate-200/60 p-5 md:p-8">
         <form onSubmit={handleSubmit} className="space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-5"><div className="space-y-2"><label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">Petugas Penjual</label><div className="w-full bg-slate-50 dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-3 min-h-[48px] text-base md:text-sm text-slate-900 dark:text-slate-100 font-bold flex items-center">{user.name}</div></div><Input label="Nama Pembeli (Opsional)" placeholder="Hamba Allah" value={form.buyerName} onChange={e => setForm({ ...form, buyerName: e.target.value })} /></div>
@@ -2320,17 +2650,24 @@ const DashboardOverview = ({ setView }) => {
     const thisMonth = today.substring(0, 7);
 
     let todayTotal = 0, monthTotal = 0;
+    let totalPiutang = 0, totalBelumLunas = 0;
     transactions.forEach(tx => {
       const txDate = tx.date.split('T')[0];
       const txMonth = tx.date.substring(0, 7);
       if (txDate === today) todayTotal += (tx.total || 0);
       if (txMonth === thisMonth) monthTotal += (tx.total || 0);
+      if (isUnpaid(tx)) {
+        totalPiutang += getRemainingAmount(tx);
+        totalBelumLunas++;
+      }
     });
 
     return {
       todaySales: todayTotal, monthSales: monthTotal, txCount: transactions.length,
       activeProducts: products.filter(p => p.isActive).length,
-      lowStock: products.filter(p => p.stock <= p.minStock && p.isActive).length
+      lowStock: products.filter(p => p.stock <= p.minStock && p.isActive).length,
+      totalPiutang,
+      totalBelumLunas
     };
   });
 
@@ -2374,6 +2711,13 @@ const DashboardOverview = ({ setView }) => {
           <div className="flex justify-between items-start">
             <div><p className={`text-xs md:text-sm font-bold uppercase tracking-wider mb-1 ${stats.lowStock > 0 ? 'text-amber-700 dark:text-amber-500' : 'text-slate-500 dark:text-slate-400'}`}>Stok Kritis</p><h3 className={`text-3xl font-black ${stats.lowStock > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-slate-900 dark:text-white'}`}>{stats.lowStock}</h3></div>
             <div className={`p-3 rounded-xl ${stats.lowStock > 0 ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400' : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400'}`}><AlertTriangle size={24} /></div>
+          </div>
+        </Card>
+        
+        <Card className={stats.totalPiutang > 0 ? 'border-red-200 bg-red-50 dark:border-red-500/20 dark:bg-[#111828]' : ''}>
+          <div className="flex justify-between items-start">
+            <div><p className={`text-xs md:text-sm font-bold uppercase tracking-wider mb-1 ${stats.totalPiutang > 0 ? 'text-red-700 dark:text-red-500' : 'text-slate-500 dark:text-slate-400'}`}>Piutang Belum Lunas</p><h3 className={`text-3xl font-black ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-900 dark:text-white'}`}>{formatRp(stats.totalPiutang)}</h3><p className={`text-xs mt-1 font-semibold ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-400'}`}>Uang di luar / belum tertagih</p><p className={`text-xs mt-0.5 font-semibold ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-400'}`}>{stats.totalBelumLunas} transaksi belum lunas</p></div>
+            <div className={`p-3 rounded-xl ${stats.totalPiutang > 0 ? 'bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400' : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400'}`}><BadgeDollarSign size={24} /></div>
           </div>
         </Card>
       </div>
@@ -2758,16 +3102,26 @@ const ProductsView = ({ showToast }) => {
     minStock: product.minStock ?? '10',
     isActive: product.isActive ?? true
   });
+  const createStockMovementFormData = (type = 'in', product = {}) => ({
+    type,
+    productId: product.id || '',
+    qty: '',
+    note: '',
+    date: formatDateInput(new Date())
+  });
 
   const [products, setProducts] = useState(() => sortProductsForInventory(db.getProducts()));
   const [productFilter, setProductFilter] = useState('all');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isStockMovementModalOpen, setIsStockMovementModalOpen] = useState(false);
   const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
+  const [isSubmittingStockMovement, setIsSubmittingStockMovement] = useState(false);
   const [isParsingImport, setIsParsingImport] = useState(false);
   const [isImportingProducts, setIsImportingProducts] = useState(false);
   const [productSource, setProductSource] = useState('Lokal');
   const [formData, setFormData] = useState(createProductFormData);
+  const [stockMovementForm, setStockMovementForm] = useState(createStockMovementFormData);
   const [importFileName, setImportFileName] = useState('');
   const [importRows, setImportRows] = useState([]);
 
@@ -3053,6 +3407,73 @@ const ProductsView = ({ showToast }) => {
     }
   };
 
+  const openStockMovementModal = (type, product = {}) => {
+    setStockMovementForm(createStockMovementFormData(type, product));
+    setIsStockMovementModalOpen(true);
+  };
+
+  const handleSaveStockMovement = async (e) => {
+    e.preventDefault();
+    if (isSubmittingStockMovement) return;
+    if (!guardUserAction(user, permissions.canManageProducts, showToast)) return;
+
+    const selectedProduct = products.find(product => product.id === stockMovementForm.productId || product.localId === stockMovementForm.productId);
+    const qty = Number(stockMovementForm.qty || 0);
+
+    if (!selectedProduct) return showToast('Pilih produk terlebih dahulu.', 'error');
+    if (!['in', 'lost'].includes(stockMovementForm.type)) return showToast('Tipe stok tidak valid.', 'error');
+    if (!Number.isFinite(qty) || qty < 1) return showToast('Qty harus lebih dari 0.', 'error');
+    if (stockMovementForm.type === 'lost' && qty > Number(selectedProduct.stock || 0)) return showToast('Qty hilang melebihi stok tersedia.', 'error');
+
+    const createdAt = stockMovementForm.date ? new Date(`${stockMovementForm.date}T12:00:00`).toISOString() : new Date().toISOString();
+    const movementPayload = {
+      productId: selectedProduct.id,
+      type: stockMovementForm.type,
+      qty,
+      note: stockMovementForm.note.trim(),
+      createdBy: user.id,
+      createdByName: user.name,
+      createdAt
+    };
+
+    setIsSubmittingStockMovement(true);
+    try {
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const currentStock = Number(selectedProduct.stock || 0);
+        const nextStock = stockMovementForm.type === 'in' ? currentStock + qty : Math.max(0, currentStock - qty);
+        const updateResult = await updateProductInDb(selectedProduct.id, {
+          stock: nextStock,
+          isActive: nextStock > 0 ? (stockMovementForm.type === 'in' ? true : selectedProduct.isActive) : false
+        });
+
+        if (!updateResult.success) throw new Error(updateResult.error || 'Gagal memperbarui stok produk.');
+
+        const movementResult = await createStikerStockMovementInDb(movementPayload);
+        if (!movementResult.success) {
+          await updateProductInDb(selectedProduct.id, { stock: currentStock, isActive: selectedProduct.isActive });
+          throw new Error(movementResult.error || 'Gagal menyimpan catatan stok. Stok dikembalikan.');
+        }
+
+        await refreshProducts();
+        await syncStikerStockMovementsCacheFromDb();
+      } else {
+        db.applyStikerStockMovement(movementPayload);
+        loadProducts();
+        setProductSource('Lokal');
+        if (health.status !== 'not_configured') showToast('Database tidak tersedia, catatan stok disimpan lokal.', 'error');
+      }
+
+      showToast(stockMovementForm.type === 'in' ? 'Barang masuk berhasil dicatat.' : 'Barang hilang berhasil dicatat.', 'success');
+      setIsStockMovementModalOpen(false);
+    } catch (err) {
+      showToast(err.message || 'Gagal menyimpan catatan stok.', 'error');
+    } finally {
+      setIsSubmittingStockMovement(false);
+    }
+  };
+
   const productHasLocalTransactions = (product) => db.getTransactions().some(tx => (
     tx.productId === product.id
     || tx.productId === product.localId
@@ -3176,7 +3597,9 @@ const ProductsView = ({ showToast }) => {
           <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Produk: {productSource}</p>
         </div>
         {canManageProductRecords && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full sm:w-auto">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 w-full sm:w-auto">
+            <Button type="button" variant="secondary" onClick={() => openStockMovementModal('in')} className="w-full sm:w-auto shadow-sm"><Plus size={18} /> Tambah Stok</Button>
+            <Button type="button" variant="secondary" onClick={() => openStockMovementModal('lost')} className="w-full sm:w-auto shadow-sm text-red-600 dark:text-red-400"><AlertTriangle size={18} /> Catat Hilang</Button>
             <Button type="button" variant="secondary" onClick={() => setIsImportModalOpen(true)} className="w-full sm:w-auto shadow-sm"><Download size={18} /> Import Produk</Button>
             <Button onClick={() => { setFormData(createProductFormData()); setIsModalOpen(true); }} className="w-full sm:w-auto shadow-lg"><Plus size={20} /> Tambah Produk</Button>
           </div>
@@ -3258,8 +3681,10 @@ const ProductsView = ({ showToast }) => {
                   {canManageProductRecords && (
                     <td className="p-4 text-right">
                       <div className="flex flex-wrap justify-end gap-2">
-                        <button onClick={() => { setFormData(createProductFormData(p)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button>
-                        <button onClick={() => handleActiveChange(p)} disabled={cannotActivate} title={cannotActivate ? 'Tambah stok terlebih dahulu' : undefined} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${p.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{p.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button>
+                         <button onClick={() => openStockMovementModal('in', p)} className="px-3 py-2 min-h-[40px] text-xs font-bold text-emerald-600 border border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400 rounded-xl shadow-sm transition-colors active:scale-95">Stok +</button>
+                         <button onClick={() => openStockMovementModal('lost', p)} disabled={Number(p.stock || 0) <= 0} className="px-3 py-2 min-h-[40px] text-xs font-bold text-red-600 border border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400 rounded-xl shadow-sm transition-colors active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">Hilang</button>
+                         <button onClick={() => { setFormData(createProductFormData(p)); setIsModalOpen(true); }} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-500 hover:text-emerald-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Edit2 size={18} /></button>
+                         <button onClick={() => handleActiveChange(p)} disabled={cannotActivate} title={cannotActivate ? 'Tambah stok terlebih dahulu' : undefined} className={`px-3 py-2 min-h-[40px] text-xs font-bold border rounded-xl shadow-sm transition-colors active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${p.isActive ? 'text-red-600 border-red-200 bg-red-50 dark:bg-red-500/10 dark:border-red-500/20 dark:text-red-400' : 'text-emerald-600 border-emerald-200 bg-emerald-50 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-400'}`}>{p.isActive ? 'Nonaktifkan' : 'Aktifkan'}</button>
                         <button onClick={() => handleDelete(p)} className="p-2 min-w-[40px] min-h-[40px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-sm transition-colors active:scale-95"><Trash2 size={18} /></button>
                       </div>
                     </td>
@@ -3300,6 +3725,44 @@ const ProductsView = ({ showToast }) => {
               <div className="flex gap-3 pt-4">
                 <Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>Batal</Button>
                 <Button type="submit" isLoading={isSubmittingProduct} className="flex-1 shadow-lg shadow-emerald-600/20">Simpan Data</Button>
+              </div>
+            </form>
+          </Card>
+        </div>
+      )}
+
+      {isStockMovementModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">
+          <Card className="w-full max-w-md shadow-2xl rounded-b-none md:rounded-2xl max-h-[90dvh] overflow-y-auto animate-fade-in-up">
+            <div className="flex justify-between items-start gap-4 mb-6 sticky top-0 bg-white dark:bg-[#111828] z-10 pt-2 pb-2">
+              <div>
+                <h2 className="text-2xl font-extrabold tracking-tight">{stockMovementForm.type === 'in' ? 'Tambah Stok / Barang Masuk' : 'Catat Hilang'}</h2>
+                <p className="text-sm text-slate-500 mt-1">Catatan ini masuk ke rekap Stok Barang.</p>
+              </div>
+              <button onClick={() => setIsStockMovementModalOpen(false)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full shrink-0"><X size={22} /></button>
+            </div>
+
+            <form onSubmit={handleSaveStockMovement} className="space-y-5 pb-6">
+              <Select
+                label="Produk"
+                value={stockMovementForm.productId}
+                onChange={e => setStockMovementForm({ ...stockMovementForm, productId: e.target.value })}
+                options={products.map(product => ({ value: product.id, label: `${product.name} - stok ${product.stock}` }))}
+                required
+              />
+              <Input label={stockMovementForm.type === 'in' ? 'Qty Masuk' : 'Qty Hilang'} type="number" min="1" value={stockMovementForm.qty} onChange={e => setStockMovementForm({ ...stockMovementForm, qty: e.target.value })} required />
+              <Input label="Tanggal" type="date" value={stockMovementForm.date} onChange={e => setStockMovementForm({ ...stockMovementForm, date: e.target.value })} required />
+              <Input label="Catatan" placeholder={stockMovementForm.type === 'in' ? 'Contoh: Restock awal bulan' : 'Contoh: Rusak / selisih opname'} value={stockMovementForm.note} onChange={e => setStockMovementForm({ ...stockMovementForm, note: e.target.value })} />
+
+              <div className={`rounded-2xl p-4 border text-sm font-semibold ${stockMovementForm.type === 'in' ? 'bg-emerald-50 text-emerald-700 border-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-400 dark:border-emerald-500/20' : 'bg-red-50 text-red-700 border-red-100 dark:bg-red-500/10 dark:text-red-400 dark:border-red-500/20'}`}>
+                {stockMovementForm.type === 'in'
+                  ? 'Stok produk akan bertambah dan produk otomatis aktif jika stok lebih dari 0.'
+                  : 'Stok produk akan berkurang. Jika stok menjadi 0, produk otomatis nonaktif.'}
+              </div>
+
+              <div className="flex gap-3 pt-4">
+                <Button type="button" variant="secondary" className="flex-1" onClick={() => setIsStockMovementModalOpen(false)}>Batal</Button>
+                <Button type="submit" isLoading={isSubmittingStockMovement} className={`flex-1 shadow-lg ${stockMovementForm.type === 'lost' ? 'bg-red-600 hover:bg-red-700 shadow-red-600/20' : 'shadow-emerald-600/20'}`}>Simpan</Button>
               </div>
             </form>
           </Card>
@@ -3389,8 +3852,9 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
   const { user } = useContext(AppContext);
   const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '' });
+  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '', paymentStatus: 'paid', debtDueDate: '', debtNote: '' });
   const [cartItems, setCartItems] = useState([]);
+  const [paymentError, setPaymentError] = useState('');
 
   useEffect(() => {
     let isMounted = true;
@@ -3471,10 +3935,14 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         items: cartItems.map(item => ({ ...item })),
         paymentMethod: form.paymentMethod, 
         notes: form.notes,
+        paymentStatus: form.paymentStatus === 'unpaid' ? 'unpaid' : 'paid',
+        debtDueDate: form.paymentStatus === 'unpaid' ? (form.debtDueDate || null) : null,
+        debtNote: form.paymentStatus === 'unpaid' ? (form.debtNote || '') : '',
         petugasId: user.id,
         namaPetugasSnapshot: user.name,
         roleSnapshot: user.role
       };
+      if (import.meta.env.DEV) console.debug('paymentStatus selected:', txPayload.paymentStatus);
       const health = await checkDatabaseConnection();
       let newTx;
 
@@ -3486,6 +3954,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         if (!profitSettingsResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
 
         const transactionDraft = db.buildTransaction(txPayload);
+        if (import.meta.env.DEV) console.debug('transaction payload:', transactionDraft);
         const createResult = await createTransactionInDb(transactionDraft);
         if (!createResult.success) throw new Error('Gagal menyimpan transaksi ke database.');
 
@@ -3507,6 +3976,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
         newTx = createResult.data;
       } else {
         newTx = db.addTransaction(txPayload);
+        if (import.meta.env.DEV) console.debug('transaction payload:', newTx);
       }
 
       setProducts(sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
@@ -3514,7 +3984,8 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
       setInvoiceData(newTx);
       setInvoiceBackView('sales');
       setView('invoice');
-      setForm({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '' });
+      setForm({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '', paymentStatus: 'paid', debtDueDate: '', debtNote: '' });
+      setPaymentError('');
       setCartItems([]);
     } catch (err) {
       showToast(err.message, 'error');
@@ -3557,6 +4028,26 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
               <Input label="Jumlah (Qty)" type="number" min="0" value={form.qty} onChange={e => handleQtyChange(e.target.value)} required />
               <Button type="button" onClick={handleAddToCart} className="self-end h-[48px]">Tambah ke Keranjang</Button>
             </div>
+          </div>
+
+          {/* Status Pembayaran */}
+          <div className="p-4 md:p-6 bg-slate-50 dark:bg-[#0a0f1c] rounded-2xl border border-slate-200 dark:border-slate-800 space-y-4">
+            <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">Status Pembayaran</label>
+            <div className="flex bg-slate-100 dark:bg-[#0a0f1c] p-1.5 rounded-xl border border-slate-200 dark:border-slate-800">
+              <button type="button" className={`flex-1 py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'paid' ? 'bg-white dark:bg-[#111828] text-emerald-700 dark:text-emerald-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'paid' })}>Lunas</button>
+              <button type="button" className={`flex-1 py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'unpaid' ? 'bg-white dark:bg-[#111828] text-red-700 dark:text-red-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'unpaid' })}>Belum Lunas</button>
+            </div>
+            {paymentError && <p className="text-xs text-red-500 font-medium">{paymentError}</p>}
+            
+            {form.paymentStatus === 'unpaid' && (
+              <div className="space-y-4 pl-2 border-l-2 border-red-200 dark:border-red-800/50">
+                <div className={`${!form.buyerName.trim() ? 'border-red-300 dark:border-red-700' : ''} rounded-xl overflow-hidden`}>
+                  <Input label="Nama Pengutang (Wajib)" placeholder="Masukkan nama pembeli..." value={form.buyerName} onChange={e => { setForm({ ...form, buyerName: e.target.value }); setPaymentError(''); }} required />
+                </div>
+                <Input label="Tanggal Jatuh Tempo (Opsional)" type="date" value={form.debtDueDate} onChange={e => setForm({ ...form, debtDueDate: e.target.value })} />
+                <Input label="Catatan Piutang (Opsional)" placeholder="Contoh: Bayar minggu depan" value={form.debtNote} onChange={e => setForm({ ...form, debtNote: e.target.value })} />
+              </div>
+            )}
           </div>
 
           <div className="bg-white dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden">
@@ -3677,6 +4168,10 @@ const InvoiceView = ({ invoiceData, setView, backView = 'sales' }) => {
           <div className="flex justify-between"><span>Pembeli:</span><span className="font-bold">{invoiceData.buyerName}</span></div>
           <div className="flex justify-between"><span>Petugas:</span><span className="font-bold">{getTransactionOfficerName(invoiceData)}</span></div>
           <div className="flex justify-between"><span>Metode:</span><span className="font-bold">{invoiceData.paymentMethod}</span></div>
+          <div className="flex justify-between"><span>Status:</span><span className={`font-bold ${isPaid(invoiceData) ? 'text-emerald-600' : 'text-red-600'}`}>{getPaymentStatusLabel(invoiceData)}</span></div>
+          {!isPaid(invoiceData) && (
+            <div className="flex justify-between"><span>Sisa Piutang:</span><span className="font-bold text-red-600">{formatRp(getRemainingAmount(invoiceData))}</span></div>
+          )}
           {invoiceData.notes && <div className="flex justify-between gap-4"><span>Catatan:</span><span className="font-bold text-right">{invoiceData.notes}</span></div>}
         </div>
         
@@ -3817,23 +4312,35 @@ const ProfitSettingsView = ({ showToast }) => {
 };
 
 const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast }) => {
+  const { user } = useContext(AppContext);
   const [transactions, setTransactions] = useState(() => db.getTransactions());
+  const [products, setProducts] = useState(() => db.getProducts());
+  const [stockMovements, setStockMovements] = useState(() => db.getStikerStockMovements());
   const [transactionSource, setTransactionSource] = useState('Lokal');
   const [activeReportTab, setActiveReportTab] = useState('history');
   const [periodFilter, setPeriodFilter] = useState('all');
   const [officerFilter, setOfficerFilter] = useState('all');
+  const [paymentFilter, setPaymentFilter] = useState('all');
   const [selectedOfficerName, setSelectedOfficerName] = useState(null);
   const [customStartDate, setCustomStartDate] = useState(formatDateInput(new Date()));
   const [customEndDate, setCustomEndDate] = useState(formatDateInput(new Date()));
+  const [confirmMarkPaid, setConfirmMarkPaid] = useState(null);
+  const [isMarkingPaid, setIsMarkingPaid] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
 
     queueMicrotask(async () => {
-      const result = await refreshTransactionsCacheWithFallback();
+      const [result, productResult, movementResult] = await Promise.all([
+        refreshTransactionsCacheWithFallback(),
+        syncProductsCacheFromDb(),
+        syncStikerStockMovementsCacheFromDb()
+      ]);
 
       if (!isMounted) return;
       setTransactions(result.data);
+      setProducts(productResult.success ? productResult.data : db.getProducts());
+      setStockMovements(movementResult.success ? movementResult.data : db.getStikerStockMovements());
       setTransactionSource(result.source === 'database' ? 'Database' : 'Lokal');
     });
 
@@ -3847,8 +4354,9 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
   const filteredTransactions = transactions.filter(tx => {
     const isTimeMatch = isDateInBounds(tx.date, periodBounds);
     const isOfficerMatch = officerFilter === 'all' || getTransactionOfficerName(tx) === officerFilter;
+    const isPaymentMatch = paymentFilter === 'all' || (paymentFilter === 'unpaid' ? isUnpaid(tx) : isPaid(tx));
 
-    return isTimeMatch && isOfficerMatch;
+    return isTimeMatch && isOfficerMatch && isPaymentMatch;
   });
 
   const totalOmzet = filteredTransactions.reduce((acc, curr) => acc + (curr.total || 0), 0);
@@ -3858,6 +4366,11 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
   const totalPetugas = filteredTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'petugas'), 0);
   const totalPengelola = filteredTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'pengelola'), 0);
   const pendingSyncCount = filteredTransactions.filter(tx => tx.syncStatus !== 'synced').length;
+  const stockReportRows = buildStockReportRows(products, transactions, stockMovements);
+  const outstandingReport = buildOutstandingReport(transactions);
+  const totalPiutang = outstandingReport.summary.totalAmount;
+  const piutangCount = outstandingReport.summary.transactionCount;
+  const unpaidTransactions = transactions.filter(tx => isUnpaid(tx));
   const filterLabel = `Periode: ${periodBounds.label} | Petugas: ${officerFilter === 'all' ? 'Semua Petugas' : officerFilter}`;
   const reportSummaryRows = [
     ['Total Transaksi', filteredTransactions.length],
@@ -3932,7 +4445,10 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
     'Total Transaksi': formatRp(tx.total),
     Metode: tx.paymentMethod || '-',
     Catatan: tx.notes || '',
-    'Status Sync': tx.syncStatus || 'pending'
+    'Status Sync': tx.syncStatus || 'pending',
+    'Status Pembayaran': getPaymentStatusLabel(tx),
+    Terbayar: formatRp(getPaidAmount(tx)),
+    'Sisa Piutang': formatRp(getRemainingAmount(tx))
   })));
   const profitExportRows = profitRowsByOfficer.map(row => ({
     Petugas: row.officerName,
@@ -3945,9 +4461,64 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
     'Bagian Petugas': formatRp(row.petugasAmount),
     'Bagian Pengelola': formatRp(row.pengelolaAmount)
   }));
-  const activeExportRows = activeReportTab === 'history' ? historyExportRows : profitExportRows;
-  const activeReportTitle = activeReportTab === 'history' ? 'Laporan Penjualan LAZISNU Garut' : 'Laporan Pembagian Laba Petugas';
-  const filePrefix = activeReportTab === 'history' ? 'laporan-transaksi' : 'laporan-laba';
+  const stockExportRows = stockReportRows.map(row => ({
+    Produk: row.productName,
+    Masuk: row.in,
+    Terjual: row.sold,
+    Piutang: row.debt,
+    Hilang: row.lost,
+    Sisa: row.remaining
+  }));
+  const outstandingExportRows = outstandingReport.detailRows.map(row => ({
+    Produk: row.productName,
+    'Nama Pengutang': row.debtorName,
+    Tanggal: formatDateTimeId(row.date),
+    Qty: row.qty,
+    Harga: formatRp(row.price),
+    'Total Piutang': formatRp(row.totalDebt),
+    Terbayar: formatRp(row.paid),
+    'Sisa Piutang': formatRp(row.remaining),
+    Status: row.status
+  }));
+  const stockSummaryRows = [
+    ['Total Produk', stockReportRows.length],
+    ['Total Masuk', stockReportRows.reduce((sum, row) => sum + row.in, 0)],
+    ['Total Terjual', stockReportRows.reduce((sum, row) => sum + row.sold, 0)],
+    ['Total Piutang Qty', stockReportRows.reduce((sum, row) => sum + row.debt, 0)],
+    ['Total Hilang', stockReportRows.reduce((sum, row) => sum + row.lost, 0)],
+    ['Total Sisa', stockReportRows.reduce((sum, row) => sum + row.remaining, 0)],
+    ['Tanggal Export', formatDateTimeId(new Date())]
+  ];
+  const outstandingSummaryRows = [
+    ['Total Uang di Luar', formatRp(outstandingReport.summary.totalAmount)],
+    ['Jumlah Transaksi Belum Lunas', outstandingReport.summary.transactionCount],
+    ['Total Qty Barang Piutang', outstandingReport.summary.totalQty],
+    ['Jumlah Pengutang', outstandingReport.summary.debtorCount],
+    ['Tanggal Export', formatDateTimeId(new Date())]
+  ];
+  const exportRowsByTab = {
+    history: historyExportRows,
+    profit: profitExportRows,
+    stock: stockExportRows,
+    debt: outstandingExportRows
+  };
+  const titleByTab = {
+    history: 'Laporan Penjualan LAZISNU Garut',
+    profit: 'Laporan Pembagian Laba Petugas',
+    stock: 'Laporan Stok Barang Stikernisasi',
+    debt: 'Laporan Uang di Luar Stikernisasi'
+  };
+  const filePrefixByTab = {
+    history: 'laporan-transaksi',
+    profit: 'laporan-laba',
+    stock: 'laporan-stok-barang',
+    debt: 'laporan-uang-di-luar'
+  };
+  const activeExportRows = exportRowsByTab[activeReportTab] || historyExportRows;
+  const activeReportTitle = titleByTab[activeReportTab] || titleByTab.history;
+  const activeSummaryRows = activeReportTab === 'stock' ? stockSummaryRows : (activeReportTab === 'debt' ? outstandingSummaryRows : reportSummaryRows);
+  const activeDataSheetName = activeReportTab === 'history' ? 'Riwayat Transaksi' : (activeReportTab === 'profit' ? 'Laba Petugas' : (activeReportTab === 'stock' ? 'Stok Barang' : 'Uang di Luar'));
+  const filePrefix = filePrefixByTab[activeReportTab] || filePrefixByTab.history;
   const filePeriodPart = getPeriodFilePart(periodFilter, customStartDate, customEndDate);
 
   const handleExportExcel = async () => {
@@ -3956,11 +4527,11 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
     try {
       const XLSX = await import('xlsx');
       const workbook = XLSX.utils.book_new();
-      const summarySheet = XLSX.utils.aoa_to_sheet([['Metrik', 'Nilai'], ...reportSummaryRows]);
+      const summarySheet = XLSX.utils.aoa_to_sheet([['Metrik', 'Nilai'], ...activeSummaryRows]);
       const dataSheet = XLSX.utils.json_to_sheet(activeExportRows);
 
       XLSX.utils.book_append_sheet(workbook, summarySheet, 'Ringkasan');
-      XLSX.utils.book_append_sheet(workbook, dataSheet, activeReportTab === 'history' ? 'Riwayat Transaksi' : 'Laba Petugas');
+      XLSX.utils.book_append_sheet(workbook, dataSheet, activeDataSheetName);
       XLSX.writeFile(workbook, `${filePrefix}-${filePeriodPart}.xlsx`);
       showToast('Laporan berhasil diexport.', 'success');
     } catch {
@@ -3994,7 +4565,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
       autoTable(pdf, {
         startY: 39,
         head: [['Ringkasan', 'Nilai']],
-        body: reportSummaryRows.slice(0, activeReportTab === 'history' ? 8 : 7),
+        body: activeSummaryRows.slice(0, activeReportTab === 'history' ? 8 : activeSummaryRows.length),
         theme: 'grid',
         headStyles: { fillColor: [5, 150, 105], textColor: 255 },
         styles: { fontSize: 8, cellPadding: 2 }
@@ -4023,6 +4594,40 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
     setView('invoice');
   };
 
+  const handleConfirmMarkPaid = async () => {
+    if (!confirmMarkPaid || isMarkingPaid) return;
+    if (!guardUserAction(user, permissions.canCreateTransaction, showToast)) return;
+
+    setIsMarkingPaid(true);
+    try {
+      const now = new Date().toISOString();
+      const payload = {
+        paymentStatus: 'paid',
+        paidAmount: toSafeNumber(confirmMarkPaid.total),
+        remainingAmount: 0,
+        debtPaidAt: now
+      };
+      const health = await checkDatabaseConnection();
+
+      if (health.status === 'connected') {
+        const result = await updateTransactionInDb(confirmMarkPaid.dbId || confirmMarkPaid.id, payload);
+        if (!result.success) throw new Error(result.error || 'Gagal menandai piutang lunas.');
+      } else {
+        db.markTransactionAsPaid(confirmMarkPaid.id);
+      }
+
+      const refreshed = await refreshTransactionsCacheWithFallback();
+      setTransactions(refreshed.data);
+      setTransactionSource(refreshed.source === 'database' ? 'Database' : 'Lokal');
+      setConfirmMarkPaid(null);
+      showToast('Piutang berhasil ditandai lunas.', 'success');
+    } catch (err) {
+      showToast(err.message || 'Gagal menandai piutang lunas.', 'error');
+    } finally {
+      setIsMarkingPaid(false);
+    }
+  };
+
   return (
     <div className="space-y-6 md:space-y-8 animate-fade-in max-w-5xl mx-auto">
       <header className="flex flex-col lg:flex-row justify-between lg:items-end gap-4 px-1 md:px-0">
@@ -4043,6 +4648,11 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
             <option value="all">Semua Petugas</option>
             {officerOptions.map(name => <option key={name} value={name}>{name}</option>)}
           </select>
+          <select value={paymentFilter} onChange={e => setPaymentFilter(e.target.value)} className="bg-white dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 min-h-[44px] text-sm font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus:border-emerald-500">
+            <option value="all">Semua Pembayaran</option>
+            <option value="paid">Lunas</option>
+            <option value="unpaid">Belum Lunas</option>
+          </select>
           <Button type="button" variant="secondary" onClick={handleExportExcel} className="px-4 py-3 min-h-[44px] text-sm shadow-none"><Download size={16} /> Excel</Button>
           <Button type="button" variant="secondary" onClick={handleExportPdf} className="px-4 py-3 min-h-[44px] text-sm shadow-none"><Download size={16} /> PDF</Button>
         </div>
@@ -4055,9 +4665,11 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
         </div>
       )}
 
-      <div className="flex gap-6 border-b border-slate-200 dark:border-slate-800">
+      <div className="flex gap-6 border-b border-slate-200 dark:border-slate-800 overflow-x-auto">
         <button type="button" onClick={() => setActiveReportTab('history')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 ${activeReportTab === 'history' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Riwayat Transaksi</button>
         <button type="button" onClick={() => setActiveReportTab('profit')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 ${activeReportTab === 'profit' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Pembagian Laba Petugas</button>
+        <button type="button" onClick={() => setActiveReportTab('stock')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 whitespace-nowrap ${activeReportTab === 'stock' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Stok Barang</button>
+        <button type="button" onClick={() => setActiveReportTab('debt')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 whitespace-nowrap ${activeReportTab === 'debt' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Piutang</button>
       </div>
 
       {activeReportTab === 'profit' && <>
@@ -4114,6 +4726,127 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
       </Card>
       </>}
 
+      {activeReportTab === 'stock' && <>
+      <div className="space-y-4">
+        <div>
+          <h2 className="text-xl md:text-2xl font-extrabold tracking-tight">Stok Barang</h2>
+          <p className="text-sm text-slate-500 mt-1">Format rekap mengikuti acuan Excel: Masuk, Terjual, Piutang, Hilang, Sisa.</p>
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Masuk</p><p className="text-2xl font-black text-slate-900 dark:text-white">{stockReportRows.reduce((sum, row) => sum + row.in, 0)}</p></Card>
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Terjual</p><p className="text-2xl font-black text-emerald-600 dark:text-emerald-500">{stockReportRows.reduce((sum, row) => sum + row.sold, 0)}</p></Card>
+          <Card className={stockReportRows.some(row => row.debt > 0) ? 'border-red-200 bg-red-50 dark:border-red-500/20 dark:bg-[#111828]' : ''}><p className="text-xs font-bold uppercase text-slate-500 mb-1">Piutang</p><p className="text-2xl font-black text-red-600 dark:text-red-400">{stockReportRows.reduce((sum, row) => sum + row.debt, 0)}</p></Card>
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Hilang</p><p className="text-2xl font-black text-amber-600 dark:text-amber-400">{stockReportRows.reduce((sum, row) => sum + row.lost, 0)}</p></Card>
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Sisa</p><p className="text-2xl font-black text-slate-900 dark:text-white">{stockReportRows.reduce((sum, row) => sum + row.remaining, 0)}</p></Card>
+        </div>
+      </div>
+
+      <Card className="p-0 border-0 md:border shadow-sm overflow-hidden bg-transparent md:bg-white dark:bg-transparent md:dark:bg-[#111828]">
+        <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0 pb-4 md:pb-0">
+          <table className="w-full text-left text-sm whitespace-nowrap bg-white dark:bg-[#111828] rounded-2xl md:rounded-none border border-slate-200 dark:border-slate-800 md:border-0 shadow-sm md:shadow-none overflow-hidden">
+            <thead className="bg-slate-50 dark:bg-[#0a0f1c] border-b border-slate-200 dark:border-slate-800">
+              <tr>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Produk</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Masuk</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Terjual</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Piutang</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Hilang</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-right">Sisa</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
+              {stockReportRows.map(row => (
+                <tr key={row.key} className="hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors">
+                  <td className="p-4 font-extrabold text-slate-900 dark:text-slate-100">{row.productName}</td>
+                  <td className="p-4 text-right font-black text-slate-900 dark:text-white">{row.in}</td>
+                  <td className="p-4 text-right font-black text-emerald-600 dark:text-emerald-500">{row.sold}</td>
+                  <td className="p-4 text-right font-black text-red-600 dark:text-red-400">{row.debt}</td>
+                  <td className="p-4 text-right font-black text-amber-600 dark:text-amber-400">{row.lost}</td>
+                  <td className="p-4 text-right font-black text-slate-900 dark:text-white">{row.remaining}</td>
+                </tr>
+              ))}
+              {stockReportRows.length === 0 && <tr><td colSpan="6" className="p-8 text-center text-slate-500 font-medium">Belum ada data stok barang.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+      </>}
+
+      {activeReportTab === 'debt' && <>
+      <div className="space-y-4">
+        <div>
+          <h2 className="text-xl md:text-2xl font-extrabold tracking-tight">Piutang & Uang di Luar</h2>
+          <p className="text-sm text-slate-500 mt-1">Daftar transaksi belum lunas tetap tersedia, ditambah rekap produk dan pengutang.</p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <Card className="border-red-200 bg-red-50 dark:border-red-500/20 dark:bg-[#111828]"><p className="text-xs font-bold uppercase text-red-700 dark:text-red-400 mb-1">Total Piutang</p><p className="text-2xl font-black text-red-600 dark:text-red-400">{formatRp(totalPiutang)}</p></Card>
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Uang di Luar</p><p className="text-2xl font-black text-slate-900 dark:text-white">{formatRp(outstandingReport.summary.totalAmount)}</p></Card>
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Qty Barang Piutang</p><p className="text-2xl font-black text-slate-900 dark:text-white">{outstandingReport.summary.totalQty}</p></Card>
+          <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Jumlah Pengutang</p><p className="text-2xl font-black text-slate-900 dark:text-white">{outstandingReport.summary.debtorCount}</p><p className="text-xs font-semibold text-slate-400 mt-1">{piutangCount} transaksi belum lunas</p></Card>
+        </div>
+      </div>
+
+      <section className="space-y-4">
+        <div>
+          <h3 className="text-lg md:text-xl font-extrabold tracking-tight">Uang di Luar per Produk</h3>
+          <p className="text-sm text-slate-500 mt-1">Sisa piutang transaksi multi item dibagi proporsional berdasarkan subtotal item.</p>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {outstandingReport.productRows.map(row => (
+            <Card key={row.key} className="space-y-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h4 className="font-black text-slate-900 dark:text-white">{row.productName}</h4>
+                  <p className="text-sm font-bold text-slate-500 mt-1">Qty Piutang: {row.qty}</p>
+                </div>
+                <p className="font-black text-red-600 dark:text-red-400 whitespace-nowrap">{formatRp(row.amount)}</p>
+              </div>
+              <div className="space-y-2 pt-3 border-t border-slate-100 dark:border-slate-800">
+                <p className="text-xs font-black uppercase tracking-wider text-slate-500">Pengutang</p>
+                {row.debtors.map(debtor => <p key={debtor.name} className="text-sm font-semibold text-slate-700 dark:text-slate-300">{debtor.name} - {formatRp(debtor.amount)}</p>)}
+              </div>
+            </Card>
+          ))}
+          {outstandingReport.productRows.length === 0 && <Card className="md:col-span-2 text-center"><p className="font-bold text-slate-500">Tidak ada uang di luar.</p></Card>}
+        </div>
+      </section>
+
+      <Card className="p-0 border-0 md:border shadow-sm overflow-hidden bg-transparent md:bg-white dark:bg-transparent md:dark:bg-[#111828]">
+        <div className="overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0 pb-4 md:pb-0">
+          <table className="w-full text-left text-sm whitespace-nowrap bg-white dark:bg-[#111828] rounded-2xl md:rounded-none border border-slate-200 dark:border-slate-800 md:border-0 shadow-sm md:shadow-none overflow-hidden">
+            <thead className="bg-slate-50 dark:bg-[#0a0f1c] border-b border-slate-200 dark:border-slate-800">
+              <tr>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Tanggal</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Pengutang</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Produk</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Sisa Piutang</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400">Status</th>
+                <th className="p-4 font-bold text-slate-600 dark:text-slate-400 text-center">Aksi</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
+              {unpaidTransactions.map(tx => (
+                <tr key={tx.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors">
+                  <td className="p-4 text-slate-600 dark:text-slate-300 font-medium">{formatDateTimeId(tx.date)}</td>
+                  <td className="p-4 font-extrabold text-slate-900 dark:text-slate-100">{tx.buyerName || 'Hamba Allah'}</td>
+                  <td className="p-4"><span className="font-bold text-slate-900 dark:text-slate-100">{getTransactionProductSummary(tx)}</span><div className="mt-1 text-xs font-semibold text-slate-500">Qty {getTransactionTotalQty(tx)}</div></td>
+                  <td className="p-4 font-black text-red-600 dark:text-red-400">{formatRp(getRemainingAmount(tx))}</td>
+                  <td className="p-4"><span className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider rounded-lg ${getPaymentStatusColor(tx)}`}>{getPaymentStatusLabel(tx)}</span></td>
+                  <td className="p-4 text-center">
+                    <div className="flex flex-wrap justify-center gap-2">
+                      <Button variant="secondary" className="px-4 py-2 min-h-[40px] text-xs shadow-none border-slate-200 dark:border-slate-700" onClick={() => setConfirmMarkPaid(tx)}><CheckCircle2 size={16} className="mr-2" /> Tandai Lunas</Button>
+                      <Button variant="secondary" className="px-4 py-2 min-h-[40px] text-xs shadow-none border-slate-200 dark:border-slate-700" onClick={() => handleViewInvoice(tx)}><Receipt size={16} className="mr-2" /> Lihat Struk</Button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {unpaidTransactions.length === 0 && <tr><td colSpan="6" className="p-8 text-center text-slate-500 font-medium">Tidak ada transaksi belum lunas.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+      </>}
+
       {activeReportTab === 'history' && <>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total Transaksi</p><p className="text-2xl font-black text-slate-900 dark:text-white">{filteredTransactions.length}</p></Card>
@@ -4163,6 +4896,28 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
         </div>
       </Card>
       </>}
+
+      {confirmMarkPaid && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">
+          <Card className="w-full max-w-md shadow-2xl rounded-b-none md:rounded-2xl animate-fade-in-up">
+            <div className="flex justify-between items-start gap-4 mb-5">
+              <div>
+                <h2 className="text-2xl font-extrabold tracking-tight">Tandai Piutang Lunas?</h2>
+                <p className="text-sm text-slate-500 mt-1">Status transaksi akan berubah menjadi Lunas.</p>
+              </div>
+              <button onClick={() => setConfirmMarkPaid(null)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full shrink-0"><X size={22} /></button>
+            </div>
+            <div className="rounded-2xl border border-red-100 dark:border-red-500/20 bg-red-50 dark:bg-red-500/10 p-4 mb-6">
+              <p className="font-extrabold text-red-700 dark:text-red-300">{confirmMarkPaid.buyerName || 'Hamba Allah'}</p>
+              <p className="text-sm text-red-600/80 dark:text-red-300/80 mt-1">Sisa piutang: {formatRp(getRemainingAmount(confirmMarkPaid))}</p>
+            </div>
+            <div className="flex gap-3">
+              <Button type="button" variant="secondary" className="flex-1" onClick={() => setConfirmMarkPaid(null)}>Batal</Button>
+              <Button type="button" className="flex-1" isLoading={isMarkingPaid} onClick={handleConfirmMarkPaid}>Tandai Lunas</Button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       {selectedOfficerReport && (
         <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-end md:items-center justify-center p-0 md:p-4 z-50">

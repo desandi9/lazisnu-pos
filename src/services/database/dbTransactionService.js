@@ -10,6 +10,25 @@ const notConfiguredResult = {
 
 const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
 
+const normalizePaymentStatus = (status) => ['paid', 'unpaid', 'partial'].includes(String(status || '').toLowerCase())
+  ? String(status || '').toLowerCase()
+  : 'paid';
+
+const getPaymentAmounts = ({ paymentStatus, total, paidAmount, remainingAmount }) => {
+  const status = normalizePaymentStatus(paymentStatus);
+  const safeTotal = Number(total || 0);
+
+  if (status === 'paid') return { paidAmount: safeTotal, remainingAmount: 0 };
+  if (status === 'unpaid') return { paidAmount: 0, remainingAmount: safeTotal };
+
+  const safePaidAmount = Math.max(0, Number(paidAmount ?? 0));
+  const safeRemainingAmount = remainingAmount !== undefined && remainingAmount !== null
+    ? Math.max(0, Number(remainingAmount || 0))
+    : Math.max(0, safeTotal - safePaidAmount);
+
+  return { paidAmount: safePaidAmount, remainingAmount: safeRemainingAmount };
+};
+
 const getTransactionItems = (tx) => {
   if (Array.isArray(tx.items) && tx.items.length > 0) return tx.items;
 
@@ -46,6 +65,15 @@ const mapDbItemToUi = (item) => {
 export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
   const items = (itemRows || transactionRow.transaction_items || []).map(mapDbItemToUi);
   const firstItem = items[0] || {};
+  const paymentStatus = normalizePaymentStatus(transactionRow.payment_status);
+  const total = Number(transactionRow.total || 0);
+  const fallbackAmounts = getPaymentAmounts({ paymentStatus, total });
+  const paidAmount = transactionRow.paid_amount !== undefined && transactionRow.paid_amount !== null
+    ? Number(transactionRow.paid_amount || 0)
+    : fallbackAmounts.paidAmount;
+  const remainingAmount = transactionRow.remaining_amount !== undefined && transactionRow.remaining_amount !== null
+    ? Number(transactionRow.remaining_amount || 0)
+    : getPaymentAmounts({ paymentStatus, total, paidAmount }).remainingAmount;
 
   return {
     dbId: transactionRow.id,
@@ -66,7 +94,7 @@ export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
     priceSnapshot: firstItem.priceSnapshot || 0,
     qty: items.reduce((sum, item) => sum + Number(item.qty || 0), 0),
     items,
-    total: Number(transactionRow.total || 0),
+    total,
     paymentMethod: transactionRow.payment_method || 'Tunai',
     notes: transactionRow.notes || '',
     syncStatus: transactionRow.sync_status || 'pending',
@@ -80,33 +108,58 @@ export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
     petugasAmount: Number(transactionRow.petugas_amount || 0),
     pengelolaAmount: Number(transactionRow.pengelola_amount || 0),
     createdAt: transactionRow.created_at || null,
-    updatedAt: transactionRow.updated_at || null
+    updatedAt: transactionRow.updated_at || null,
+    // -- Piutang fields --
+    paymentStatus,
+    paidAmount,
+    remainingAmount,
+    debtDueDate: transactionRow.debt_due_date || null,
+    debtPaidAt: transactionRow.debt_paid_at || null,
+    debtNote: transactionRow.debt_note || null
   };
 };
 
-export const mapTransactionToDb = (transaction, userIdByLocalId = new Map()) => ({
-  transaction_number: transaction.transactionNumber || transaction.nomorTransaksi || transaction.id,
-  date: transaction.date || new Date().toISOString(),
-  buyer_name: transaction.buyerName || 'Hamba Allah',
-  petugas_id: isUuid(transaction.petugasId) ? transaction.petugasId : (userIdByLocalId.get(transaction.petugasId) || null),
-  nama_petugas_snapshot: transaction.namaPetugasSnapshot || '-',
-  role_snapshot: transaction.roleSnapshot || '-',
-  total: Number(transaction.total || 0),
-  payment_method: transaction.paymentMethod || 'Tunai',
-  notes: transaction.notes || '',
-  sync_status: transaction.syncStatus || 'pending',
-  synced_at: transaction.syncedAt || null,
-  lazisnu_percent_snapshot: Number(transaction.lazisnuPercentSnapshot ?? 30),
-  pcnu_percent_snapshot: Number(transaction.pcnuPercentSnapshot ?? 30),
-  petugas_percent_snapshot: Number(transaction.petugasPercentSnapshot ?? 30),
-  pengelola_percent_snapshot: Number(transaction.pengelolaPercentSnapshot ?? 10),
-  lazisnu_amount: Number(transaction.lazisnuAmount || 0),
-  pcnu_amount: Number(transaction.pcnuAmount || 0),
-  petugas_amount: Number(transaction.petugasAmount || 0),
-  pengelola_amount: Number(transaction.pengelolaAmount || 0),
-  created_at: transaction.createdAt || transaction.date || new Date().toISOString(),
-  updated_at: new Date().toISOString()
-});
+export const mapTransactionToDb = (transaction, userIdByLocalId = new Map()) => {
+  const paymentStatus = normalizePaymentStatus(transaction.paymentStatus);
+  const total = Number(transaction.total || 0);
+  const amounts = getPaymentAmounts({
+    paymentStatus,
+    total,
+    paidAmount: transaction.paidAmount,
+    remainingAmount: transaction.remainingAmount
+  });
+
+  return {
+    transaction_number: transaction.transactionNumber || transaction.nomorTransaksi || transaction.id,
+    date: transaction.date || new Date().toISOString(),
+    buyer_name: transaction.buyerName || 'Hamba Allah',
+    petugas_id: isUuid(transaction.petugasId) ? transaction.petugasId : (userIdByLocalId.get(transaction.petugasId) || null),
+    nama_petugas_snapshot: transaction.namaPetugasSnapshot || '-',
+    role_snapshot: transaction.roleSnapshot || '-',
+    total,
+    payment_method: transaction.paymentMethod || 'Tunai',
+    notes: transaction.notes || '',
+    sync_status: transaction.syncStatus || 'pending',
+    synced_at: transaction.syncedAt || null,
+    lazisnu_percent_snapshot: Number(transaction.lazisnuPercentSnapshot ?? 30),
+    pcnu_percent_snapshot: Number(transaction.pcnuPercentSnapshot ?? 30),
+    petugas_percent_snapshot: Number(transaction.petugasPercentSnapshot ?? 30),
+    pengelola_percent_snapshot: Number(transaction.pengelolaPercentSnapshot ?? 10),
+    lazisnu_amount: Number(transaction.lazisnuAmount || 0),
+    pcnu_amount: Number(transaction.pcnuAmount || 0),
+    petugas_amount: Number(transaction.petugasAmount || 0),
+    pengelola_amount: Number(transaction.pengelolaAmount || 0),
+    created_at: transaction.createdAt || transaction.date || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    // -- Piutang fields --
+    payment_status: paymentStatus,
+    paid_amount: amounts.paidAmount,
+    remaining_amount: amounts.remainingAmount,
+    debt_due_date: paymentStatus === 'unpaid' || paymentStatus === 'partial' ? (transaction.debtDueDate || null) : null,
+    debt_paid_at: paymentStatus === 'paid' ? (transaction.debtPaidAt || new Date().toISOString()) : null,
+    debt_note: paymentStatus === 'unpaid' || paymentStatus === 'partial' ? (transaction.debtNote || '') : null
+  };
+};
 
 export const mapTransactionItemToDb = (item, transactionId, productIdByLocalId = new Map()) => ({
   transaction_id: transactionId,
@@ -223,6 +276,7 @@ export async function createTransactionInDb(transaction) {
   try {
     const { userIdByLocalId } = await getLocalIdMaps();
     const row = mapTransactionToDb(transaction, userIdByLocalId);
+    if (import.meta.env.DEV) console.debug('db payload:', row);
     const { data, error } = await supabase.from('transactions').insert(row).select('*').single();
     if (error) throw error;
 
@@ -243,6 +297,12 @@ export async function updateTransactionInDb(transactionId, payload) {
       ...(payload.syncStatus !== undefined || payload.sync_status !== undefined ? { sync_status: payload.syncStatus ?? payload.sync_status } : {}),
       ...(payload.syncedAt !== undefined || payload.synced_at !== undefined ? { synced_at: payload.syncedAt ?? payload.synced_at } : {}),
       ...(payload.notes !== undefined ? { notes: payload.notes } : {}),
+      ...(payload.paymentStatus !== undefined || payload.payment_status !== undefined ? { payment_status: payload.paymentStatus ?? payload.payment_status } : {}),
+      ...(payload.paidAmount !== undefined || payload.paid_amount !== undefined ? { paid_amount: Number(payload.paidAmount ?? payload.paid_amount ?? 0) } : {}),
+      ...(payload.remainingAmount !== undefined || payload.remaining_amount !== undefined ? { remaining_amount: Number(payload.remainingAmount ?? payload.remaining_amount ?? 0) } : {}),
+      ...(payload.debtDueDate !== undefined || payload.debt_due_date !== undefined ? { debt_due_date: payload.debtDueDate ?? payload.debt_due_date } : {}),
+      ...(payload.debtPaidAt !== undefined || payload.debt_paid_at !== undefined ? { debt_paid_at: payload.debtPaidAt ?? payload.debt_paid_at } : {}),
+      ...(payload.debtNote !== undefined || payload.debt_note !== undefined ? { debt_note: payload.debtNote ?? payload.debt_note } : {}),
       updated_at: new Date().toISOString()
     };
 

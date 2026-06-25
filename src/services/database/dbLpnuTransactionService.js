@@ -9,7 +9,7 @@ const notConfiguredResult = {
   error: 'Supabase belum dikonfigurasi.'
 };
 
-const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i.test(String(value || ''));
+const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ''));
 
 const numberValue = (value) => Number(value || 0);
 
@@ -166,7 +166,16 @@ export async function createLpnuTransactionItemsInDb(transactionId, items) {
   try {
     const rows = items.map(item => mapLpnuTransactionItemToDb(item, transactionId));
     const { data, error } = await supabase.from('lpnu_transaction_items').insert(rows).select('*');
-    if (error) throw error;
+    if (error) {
+      console.error('LPNU transaction items insert failed', {
+        message: error.message || null,
+        details: error.details || null,
+        hint: error.hint || null,
+        code: error.code || null,
+        rows
+      });
+      throw error;
+    }
 
     return { success: true, data: (data || []).map(mapLpnuTransactionItemFromDb) };
   } catch (error) {
@@ -180,7 +189,16 @@ export async function createLpnuTransactionInDb(transaction) {
   try {
     const row = mapLpnuTransactionToDb(transaction);
     const { data, error } = await supabase.from('lpnu_transactions').insert(row).select('*').single();
-    if (error) throw error;
+    if (error) {
+      console.error('LPNU transaction insert failed', {
+        message: error.message || null,
+        details: error.details || null,
+        hint: error.hint || null,
+        code: error.code || null,
+        row
+      });
+      throw error;
+    }
 
     const itemsResult = await createLpnuTransactionItemsInDb(data.id, getLpnuTransactionItems(transaction));
     if (!itemsResult.success) {

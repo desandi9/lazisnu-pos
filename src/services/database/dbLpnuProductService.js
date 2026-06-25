@@ -8,7 +8,7 @@ const notConfiguredResult = {
   error: 'Supabase belum dikonfigurasi.'
 };
 
-export const isLpnuProductDbId = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i.test(String(value || ''));
+export const isLpnuProductDbId = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ''));
 
 const isMissingPeciFinanceColumnError = (error) => /supplier_share|lpnu_share|pcnu_share|lazisnu_share|lazisnu_infaq_percent/i.test(error?.message || '');
 
