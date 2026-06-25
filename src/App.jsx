@@ -209,13 +209,20 @@ const getTransactionProfitPercent = (tx, key) => tx[`${key}PercentSnapshot`] ?? 
 const getTransactionProfitAmount = (tx, key) => tx[`${key}Amount`] ?? 0;
 
 // -- Piutang helpers --
-const getPaymentStatus = (tx) => tx.paymentStatus || 'paid';
+const normalizePaymentStatus = (status) => ['paid', 'unpaid', 'partial'].includes(String(status || '').toLowerCase())
+  ? String(status || '').toLowerCase()
+  : 'paid';
+const toSafeNumber = (value) => {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
+};
+const getPaymentStatus = (tx) => normalizePaymentStatus(tx?.paymentStatus ?? tx?.payment_status);
 const getPaymentStatusLabel = (tx) => {
   const status = getPaymentStatus(tx);
-  if (status === 'paid') return 'Lunas';
-  if (status === 'unpaid') return 'Belum Lunas';
-  if (status === 'partial') return 'Sebagian';
-  return 'Lunas';
+  if (status === 'paid') return 'Sukses / Lunas';
+  if (status === 'unpaid') return 'Pending / Piutang';
+  if (status === 'partial') return 'Pending / Piutang Sebagian';
+  return 'Sukses / Lunas';
 };
 const getPaymentStatusColor = (tx) => {
   const status = getPaymentStatus(tx);
@@ -223,19 +230,17 @@ const getPaymentStatusColor = (tx) => {
   if (status === 'unpaid') return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
   return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400';
 };
-const getPaidAmount = (tx) => Number(tx.paidAmount ?? (getPaymentStatus(tx) === 'paid' ? tx.total : 0) ?? 0);
+const getPaidAmount = (tx) => toSafeNumber(tx?.paidAmount ?? (getPaymentStatus(tx) === 'paid' ? tx?.total : 0));
 const getRemainingAmount = (tx) => {
-  if (tx.remainingAmount !== undefined && tx.remainingAmount !== null) return Number(tx.remainingAmount || 0);
+  if (tx?.remainingAmount !== undefined && tx?.remainingAmount !== null) return toSafeNumber(tx.remainingAmount);
   if (getPaymentStatus(tx) === 'paid') return 0;
 
-  return Math.max(0, Number(tx.total || 0) - getPaidAmount(tx));
+  return Math.max(0, toSafeNumber(tx?.total) - getPaidAmount(tx));
 };
-const isPaid = (tx) => getPaymentStatus(tx) === 'paid';
-const isUnpaid = (tx) => getPaymentStatus(tx) === 'unpaid' || getPaymentStatus(tx) === 'partial';
-const toSafeNumber = (value) => {
-  const number = Number(value || 0);
-  return Number.isFinite(number) ? number : 0;
-};
+const isTransactionSuccess = (tx) => getPaymentStatus(tx) === 'paid';
+const isTransactionPending = (tx) => ['unpaid', 'partial'].includes(getPaymentStatus(tx));
+const isPaid = isTransactionSuccess;
+const isUnpaid = isTransactionPending;
 const getNormalizedKey = (value) => String(value || '').trim().toLowerCase();
 const getProductReportKey = (product) => product?.id || product?.localId || getNormalizedKey(product?.name) || `product-${Math.random()}`;
 const getItemReportKey = (item) => item.productId || item.product_id || getNormalizedKey(item.productNameSnapshot || item.product_name_snapshot || item.name);
@@ -361,7 +366,7 @@ const buildOutstandingReport = (transactions = []) => {
         totalDebt: subtotal,
         paid: Math.max(0, subtotal - safeItemRemaining),
         remaining: safeItemRemaining,
-        status: getPaymentStatusLabel(tx)
+        status: 'Pending'
       });
     });
   });
@@ -400,6 +405,26 @@ const calculateProfitSharing = (total, settings) => ({
   petugasAmount: Math.round(total * settings.petugasPercent / 100),
   pengelolaAmount: Math.round(total * settings.pengelolaPercent / 100)
 });
+
+const getPaymentAmountsForTransaction = (txData, total) => {
+  const safeTotal = Math.max(0, toSafeNumber(total));
+  const requestedStatus = normalizePaymentStatus(txData?.paymentStatus);
+
+  if (requestedStatus === 'paid') {
+    return { paymentStatus: 'paid', paidAmount: safeTotal, remainingAmount: 0 };
+  }
+
+  if (requestedStatus === 'partial') {
+    const paidAmount = Math.min(safeTotal, Math.max(0, toSafeNumber(txData?.paidAmount)));
+
+    if (paidAmount >= safeTotal) return { paymentStatus: 'paid', paidAmount: safeTotal, remainingAmount: 0 };
+    if (paidAmount <= 0) return { paymentStatus: 'unpaid', paidAmount: 0, remainingAmount: safeTotal };
+
+    return { paymentStatus: 'partial', paidAmount, remainingAmount: safeTotal - paidAmount };
+  }
+
+  return { paymentStatus: 'unpaid', paidAmount: 0, remainingAmount: safeTotal };
+};
 
 const DEFAULT_LPNU_PECI_SHARING = {
   supplierShare: 40000,
@@ -751,9 +776,7 @@ class DatabaseService {
     const profitSharing = calculateProfitSharing(total, this.getProfitSharingSettings());
     const firstItem = items[0];
 
-    const paymentStatus = txData.paymentStatus === 'unpaid' ? 'unpaid' : 'paid';
-    const paidAmount = paymentStatus === 'paid' ? total : 0;
-    const remainingAmount = paymentStatus === 'paid' ? 0 : total;
+    const { paymentStatus, paidAmount, remainingAmount } = getPaymentAmountsForTransaction(txData, total);
 
     return {
       id: `TX-${Date.now()}`,
@@ -785,9 +808,9 @@ class DatabaseService {
       paymentStatus,
       paidAmount,
       remainingAmount,
-      debtDueDate: paymentStatus === 'unpaid' ? (txData.debtDueDate || null) : null,
+      debtDueDate: isTransactionPending({ paymentStatus }) ? (txData.debtDueDate || null) : null,
       debtPaidAt: paymentStatus === 'paid' ? new Date().toISOString() : null,
-      debtNote: paymentStatus === 'unpaid' ? (txData.debtNote || null) : null
+      debtNote: isTransactionPending({ paymentStatus }) ? (txData.debtNote || null) : null
     };
   }
 
@@ -843,9 +866,7 @@ class DatabaseService {
     const profitSharing = calculateProfitSharing(total, this.getProfitSharingSettings());
     const firstItem = items[0];
 
-    const paymentStatus = txData.paymentStatus === 'unpaid' ? 'unpaid' : 'paid';
-    const paidAmount = paymentStatus === 'paid' ? total : 0;
-    const remainingAmount = paymentStatus === 'paid' ? 0 : total;
+    const { paymentStatus, paidAmount, remainingAmount } = getPaymentAmountsForTransaction(txData, total);
 
     const newTx = {
       id: `TX-${Date.now()}`,
@@ -877,9 +898,9 @@ class DatabaseService {
       paymentStatus,
       paidAmount,
       remainingAmount,
-      debtDueDate: paymentStatus === 'unpaid' ? (txData.debtDueDate || null) : null,
+      debtDueDate: isTransactionPending({ paymentStatus }) ? (txData.debtDueDate || null) : null,
       debtPaidAt: paymentStatus === 'paid' ? new Date().toISOString() : null,
-      debtNote: paymentStatus === 'unpaid' ? (txData.debtNote || null) : null
+      debtNote: isTransactionPending({ paymentStatus }) ? (txData.debtNote || null) : null
     };
     
     const transactions = this.getTransactions();
@@ -911,7 +932,7 @@ class DatabaseService {
     const now = new Date().toISOString();
     return this.updateTransactionPaymentStatus(txId, {
       paymentStatus: 'paid',
-      paidAmount: tx.total,
+      paidAmount: toSafeNumber(tx.total),
       remainingAmount: 0,
       debtPaidAt: now
     });
@@ -921,13 +942,14 @@ class DatabaseService {
     const transactions = this.getTransactions();
     const tx = transactions.find(t => t.id === txId);
     if (!tx) throw new Error('Transaksi tidak ditemukan.');
-    if (amount <= 0) throw new Error('Nominal pembayaran harus lebih dari 0.');
+    if (toSafeNumber(amount) <= 0) throw new Error('Nominal pembayaran harus lebih dari 0.');
 
-    const newPaidAmount = (tx.paidAmount || 0) + amount;
-    if (newPaidAmount >= tx.total) {
+    const total = toSafeNumber(tx.total);
+    const newPaidAmount = getPaidAmount(tx) + toSafeNumber(amount);
+    if (newPaidAmount >= total) {
       return this.updateTransactionPaymentStatus(txId, {
         paymentStatus: 'paid',
-        paidAmount: tx.total,
+        paidAmount: total,
         remainingAmount: 0,
         debtPaidAt: new Date().toISOString()
       });
@@ -936,7 +958,7 @@ class DatabaseService {
     return this.updateTransactionPaymentStatus(txId, {
       paymentStatus: 'partial',
       paidAmount: newPaidAmount,
-      remainingAmount: tx.total - newPaidAmount
+      remainingAmount: total - newPaidAmount
     });
   }
 
@@ -998,9 +1020,9 @@ class DatabaseService {
       'Rp Pengelola': getTransactionProfitAmount(tx, 'pengelola'),
       'Waktu Sync': syncedAt,
       // -- Piutang fields --
-      'Status Pembayaran': tx.paymentStatus === 'paid' ? 'Lunas' : (tx.paymentStatus === 'unpaid' ? 'Belum Lunas' : 'Sebagian'),
-      Terbayar: tx.paidAmount || 0,
-      'Sisa Piutang': tx.remainingAmount || 0,
+      'Status Pembayaran': getPaymentStatusLabel(tx),
+      Terbayar: getPaidAmount(tx),
+      'Sisa Piutang': getRemainingAmount(tx),
       'Tanggal Lunas': tx.debtPaidAt || '',
       'Catatan Piutang': tx.debtNote || ''
     })));
@@ -2649,13 +2671,19 @@ const DashboardOverview = ({ setView }) => {
     const today = new Date().toISOString().split('T')[0];
     const thisMonth = today.substring(0, 7);
 
-    let todayTotal = 0, monthTotal = 0;
+    let todayTotal = 0, monthTotal = 0, todayProfit = 0, successCount = 0;
     let totalPiutang = 0, totalBelumLunas = 0;
     transactions.forEach(tx => {
       const txDate = tx.date.split('T')[0];
       const txMonth = tx.date.substring(0, 7);
-      if (txDate === today) todayTotal += (tx.total || 0);
-      if (txMonth === thisMonth) monthTotal += (tx.total || 0);
+      if (isPaid(tx)) {
+        successCount++;
+        if (txDate === today) {
+          todayTotal += toSafeNumber(tx.total);
+          todayProfit += getTransactionProfitAmount(tx, 'lazisnu') + getTransactionProfitAmount(tx, 'pcnu') + getTransactionProfitAmount(tx, 'petugas') + getTransactionProfitAmount(tx, 'pengelola');
+        }
+        if (txMonth === thisMonth) monthTotal += toSafeNumber(tx.total);
+      }
       if (isUnpaid(tx)) {
         totalPiutang += getRemainingAmount(tx);
         totalBelumLunas++;
@@ -2663,7 +2691,7 @@ const DashboardOverview = ({ setView }) => {
     });
 
     return {
-      todaySales: todayTotal, monthSales: monthTotal, txCount: transactions.length,
+      todaySales: todayTotal, monthSales: monthTotal, todayProfit, txCount: successCount,
       activeProducts: products.filter(p => p.isActive).length,
       lowStock: products.filter(p => p.stock <= p.minStock && p.isActive).length,
       totalPiutang,
@@ -2681,21 +2709,28 @@ const DashboardOverview = ({ setView }) => {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-5">
         <Card className="bg-emerald-50 dark:bg-emerald-900/10 border-emerald-100 dark:border-emerald-800/50">
           <div className="flex justify-between items-start">
-            <div><p className="text-emerald-800 dark:text-emerald-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Penjualan Hari Ini</p><h3 className="text-3xl font-black text-emerald-600 dark:text-emerald-500">{formatRp(stats.todaySales)}</h3></div>
+            <div><p className="text-emerald-800 dark:text-emerald-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Omzet Hari Ini</p><h3 className="text-3xl font-black text-emerald-600 dark:text-emerald-500">{formatRp(stats.todaySales)}</h3><p className="text-xs mt-1 font-semibold text-emerald-700 dark:text-emerald-400">Hanya transaksi lunas</p></div>
             <div className="p-3 bg-emerald-200/50 dark:bg-emerald-500/20 rounded-xl text-emerald-600 dark:text-emerald-400"><ShoppingCart size={24} /></div>
           </div>
         </Card>
         
         <Card>
           <div className="flex justify-between items-start">
-            <div><p className="text-slate-500 dark:text-slate-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Bulan Ini</p><h3 className="text-3xl font-black text-slate-900 dark:text-white">{formatRp(stats.monthSales)}</h3></div>
+            <div><p className="text-slate-500 dark:text-slate-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Omzet Bulan Ini</p><h3 className="text-3xl font-black text-slate-900 dark:text-white">{formatRp(stats.monthSales)}</h3><p className="text-xs mt-1 font-semibold text-slate-400">Hanya transaksi lunas</p></div>
             <div className="p-3 bg-slate-100 dark:bg-slate-800 rounded-xl text-slate-500 dark:text-slate-400"><LayoutDashboard size={24} /></div>
+          </div>
+        </Card>
+
+        <Card>
+          <div className="flex justify-between items-start">
+            <div><p className="text-slate-500 dark:text-slate-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Laba Hari Ini</p><h3 className="text-3xl font-black text-slate-900 dark:text-white">{formatRp(stats.todayProfit)}</h3><p className="text-xs mt-1 font-semibold text-slate-400">Hanya transaksi lunas</p></div>
+            <div className="p-3 bg-slate-100 dark:bg-slate-800 rounded-xl text-slate-500 dark:text-slate-400"><PieChart size={24} /></div>
           </div>
         </Card>
         
         <Card>
           <div className="flex justify-between items-start">
-            <div><p className="text-slate-500 dark:text-slate-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Total Transaksi</p><h3 className="text-3xl font-black text-slate-900 dark:text-white">{stats.txCount}</h3></div>
+            <div><p className="text-slate-500 dark:text-slate-400 text-xs md:text-sm font-bold uppercase tracking-wider mb-1">Transaksi Sukses</p><h3 className="text-3xl font-black text-slate-900 dark:text-white">{stats.txCount}</h3><p className="text-xs mt-1 font-semibold text-slate-400">Status lunas</p></div>
             <div className="p-3 bg-slate-100 dark:bg-slate-800 rounded-xl text-slate-500 dark:text-slate-400"><FileText size={24} /></div>
           </div>
         </Card>
@@ -2716,7 +2751,7 @@ const DashboardOverview = ({ setView }) => {
         
         <Card className={stats.totalPiutang > 0 ? 'border-red-200 bg-red-50 dark:border-red-500/20 dark:bg-[#111828]' : ''}>
           <div className="flex justify-between items-start">
-            <div><p className={`text-xs md:text-sm font-bold uppercase tracking-wider mb-1 ${stats.totalPiutang > 0 ? 'text-red-700 dark:text-red-500' : 'text-slate-500 dark:text-slate-400'}`}>Piutang Belum Lunas</p><h3 className={`text-3xl font-black ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-900 dark:text-white'}`}>{formatRp(stats.totalPiutang)}</h3><p className={`text-xs mt-1 font-semibold ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-400'}`}>Uang di luar / belum tertagih</p><p className={`text-xs mt-0.5 font-semibold ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-400'}`}>{stats.totalBelumLunas} transaksi belum lunas</p></div>
+            <div><p className={`text-xs md:text-sm font-bold uppercase tracking-wider mb-1 ${stats.totalPiutang > 0 ? 'text-red-700 dark:text-red-500' : 'text-slate-500 dark:text-slate-400'}`}>Pending Piutang</p><h3 className={`text-3xl font-black ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-900 dark:text-white'}`}>{formatRp(stats.totalPiutang)}</h3><p className={`text-xs mt-1 font-semibold ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-400'}`}>Uang di Luar</p><p className={`text-xs mt-0.5 font-semibold ${stats.totalPiutang > 0 ? 'text-red-600 dark:text-red-400' : 'text-slate-400'}`}>{stats.totalBelumLunas} transaksi pending/piutang</p></div>
             <div className={`p-3 rounded-xl ${stats.totalPiutang > 0 ? 'bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400' : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400'}`}><BadgeDollarSign size={24} /></div>
           </div>
         </Card>
@@ -3852,7 +3887,7 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
   const { user } = useContext(AppContext);
   const [products, setProducts] = useState(() => sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '', paymentStatus: 'paid', debtDueDate: '', debtNote: '' });
+  const [form, setForm] = useState({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '', paymentStatus: 'paid', paidAmount: '', debtDueDate: '', debtNote: '' });
   const [cartItems, setCartItems] = useState([]);
   const [paymentError, setPaymentError] = useState('');
 
@@ -3930,14 +3965,28 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
 
     setIsSubmitting(true);
     try {
+      const paymentStatus = normalizePaymentStatus(form.paymentStatus);
+      const paidAmount = paymentStatus === 'partial' ? toSafeNumber(form.paidAmount) : 0;
+
+      if (isTransactionPending({ paymentStatus }) && !form.buyerName.trim()) {
+        setPaymentError('Nama pengutang wajib diisi untuk transaksi piutang.');
+        throw new Error('Nama pengutang wajib diisi untuk transaksi piutang.');
+      }
+
+      if (paymentStatus === 'partial' && (paidAmount <= 0 || paidAmount >= cartTotal)) {
+        setPaymentError('Nominal DP harus lebih dari 0 dan kurang dari total transaksi.');
+        throw new Error('Nominal DP harus lebih dari 0 dan kurang dari total transaksi.');
+      }
+
       const txPayload = {
         buyerName: form.buyerName,
         items: cartItems.map(item => ({ ...item })),
         paymentMethod: form.paymentMethod, 
         notes: form.notes,
-        paymentStatus: form.paymentStatus === 'unpaid' ? 'unpaid' : 'paid',
-        debtDueDate: form.paymentStatus === 'unpaid' ? (form.debtDueDate || null) : null,
-        debtNote: form.paymentStatus === 'unpaid' ? (form.debtNote || '') : '',
+        paymentStatus,
+        paidAmount: paymentStatus === 'partial' ? paidAmount : undefined,
+        debtDueDate: isTransactionPending({ paymentStatus }) ? (form.debtDueDate || null) : null,
+        debtNote: isTransactionPending({ paymentStatus }) ? (form.debtNote || '') : '',
         petugasId: user.id,
         namaPetugasSnapshot: user.name,
         roleSnapshot: user.role
@@ -3980,11 +4029,11 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
       }
 
       setProducts(sortProductsByCategory(db.getProducts().filter(p => p.isActive && p.stock > 0)));
-      showToast('Transaksi berhasil disimpan');
+      showToast(isTransactionPending(newTx) ? 'Transaksi masuk Pending/Piutang, belum dihitung omzet.' : 'Transaksi berhasil disimpan');
       setInvoiceData(newTx);
       setInvoiceBackView('sales');
       setView('invoice');
-      setForm({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '', paymentStatus: 'paid', debtDueDate: '', debtNote: '' });
+      setForm({ buyerName: '', productId: '', qty: 0, paymentMethod: 'Tunai', notes: '', paymentStatus: 'paid', paidAmount: '', debtDueDate: '', debtNote: '' });
       setPaymentError('');
       setCartItems([]);
     } catch (err) {
@@ -4033,17 +4082,21 @@ const SalesView = ({ showToast, setView, setInvoiceData, setInvoiceBackView }) =
           {/* Status Pembayaran */}
           <div className="p-4 md:p-6 bg-slate-50 dark:bg-[#0a0f1c] rounded-2xl border border-slate-200 dark:border-slate-800 space-y-4">
             <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300">Status Pembayaran</label>
-            <div className="flex bg-slate-100 dark:bg-[#0a0f1c] p-1.5 rounded-xl border border-slate-200 dark:border-slate-800">
-              <button type="button" className={`flex-1 py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'paid' ? 'bg-white dark:bg-[#111828] text-emerald-700 dark:text-emerald-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'paid' })}>Lunas</button>
-              <button type="button" className={`flex-1 py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'unpaid' ? 'bg-white dark:bg-[#111828] text-red-700 dark:text-red-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'unpaid' })}>Belum Lunas</button>
+            <div className="grid grid-cols-3 gap-1.5 bg-slate-100 dark:bg-[#0a0f1c] p-1.5 rounded-xl border border-slate-200 dark:border-slate-800">
+              <button type="button" className={`py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'paid' ? 'bg-white dark:bg-[#111828] text-emerald-700 dark:text-emerald-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'paid', paidAmount: '' })}>Lunas</button>
+              <button type="button" className={`py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'unpaid' ? 'bg-white dark:bg-[#111828] text-red-700 dark:text-red-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'unpaid', paidAmount: '' })}>Belum Lunas</button>
+              <button type="button" className={`py-3 text-sm font-semibold rounded-lg transition-all select-none ${form.paymentStatus === 'partial' ? 'bg-white dark:bg-[#111828] text-amber-700 dark:text-amber-500 shadow-sm border border-slate-200 dark:border-slate-700' : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`} onClick={() => setForm({ ...form, paymentStatus: 'partial' })}>DP / Sebagian</button>
             </div>
             {paymentError && <p className="text-xs text-red-500 font-medium">{paymentError}</p>}
             
-            {form.paymentStatus === 'unpaid' && (
+            {isTransactionPending(form) && (
               <div className="space-y-4 pl-2 border-l-2 border-red-200 dark:border-red-800/50">
                 <div className={`${!form.buyerName.trim() ? 'border-red-300 dark:border-red-700' : ''} rounded-xl overflow-hidden`}>
                   <Input label="Nama Pengutang (Wajib)" placeholder="Masukkan nama pembeli..." value={form.buyerName} onChange={e => { setForm({ ...form, buyerName: e.target.value }); setPaymentError(''); }} required />
                 </div>
+                {form.paymentStatus === 'partial' && (
+                  <Input label="Nominal DP" type="number" min="1" max={Math.max(1, cartTotal - 1)} placeholder="Masukkan nominal DP" value={form.paidAmount} onChange={e => { setForm({ ...form, paidAmount: e.target.value }); setPaymentError(''); }} required />
+                )}
                 <Input label="Tanggal Jatuh Tempo (Opsional)" type="date" value={form.debtDueDate} onChange={e => setForm({ ...form, debtDueDate: e.target.value })} />
                 <Input label="Catatan Piutang (Opsional)" placeholder="Contoh: Bayar minggu depan" value={form.debtNote} onChange={e => setForm({ ...form, debtNote: e.target.value })} />
               </div>
@@ -4351,31 +4404,32 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
 
   const periodBounds = getPeriodBounds(periodFilter, customStartDate, customEndDate);
   const officerOptions = db.getUsers().filter(item => item.role === 'admin').map(item => item.name);
-  const filteredTransactions = transactions.filter(tx => {
+  const baseFilteredTransactions = transactions.filter(tx => {
     const isTimeMatch = isDateInBounds(tx.date, periodBounds);
     const isOfficerMatch = officerFilter === 'all' || getTransactionOfficerName(tx) === officerFilter;
-    const isPaymentMatch = paymentFilter === 'all' || (paymentFilter === 'unpaid' ? isUnpaid(tx) : isPaid(tx));
 
-    return isTimeMatch && isOfficerMatch && isPaymentMatch;
+    return isTimeMatch && isOfficerMatch;
   });
+  const paidReportTransactions = paymentFilter === 'unpaid' ? [] : baseFilteredTransactions.filter(tx => isPaid(tx));
+  const pendingReportTransactions = paymentFilter === 'paid' ? [] : baseFilteredTransactions.filter(tx => isUnpaid(tx));
 
-  const totalOmzet = filteredTransactions.reduce((acc, curr) => acc + (curr.total || 0), 0);
-  const totalQty = filteredTransactions.reduce((acc, curr) => acc + getTransactionTotalQty(curr), 0);
-  const totalLazisnu = filteredTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'lazisnu'), 0);
-  const totalPcnu = filteredTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'pcnu'), 0);
-  const totalPetugas = filteredTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'petugas'), 0);
-  const totalPengelola = filteredTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'pengelola'), 0);
-  const pendingSyncCount = filteredTransactions.filter(tx => tx.syncStatus !== 'synced').length;
+  const totalOmzet = paidReportTransactions.reduce((acc, curr) => acc + toSafeNumber(curr.total), 0);
+  const totalQty = paidReportTransactions.reduce((acc, curr) => acc + getTransactionTotalQty(curr), 0);
+  const totalLazisnu = paidReportTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'lazisnu'), 0);
+  const totalPcnu = paidReportTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'pcnu'), 0);
+  const totalPetugas = paidReportTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'petugas'), 0);
+  const totalPengelola = paidReportTransactions.reduce((acc, curr) => acc + getTransactionProfitAmount(curr, 'pengelola'), 0);
+  const pendingSyncCount = paidReportTransactions.filter(tx => tx.syncStatus !== 'synced').length;
   const stockReportRows = buildStockReportRows(products, transactions, stockMovements);
-  const outstandingReport = buildOutstandingReport(transactions);
+  const outstandingReport = buildOutstandingReport(pendingReportTransactions);
   const totalPiutang = outstandingReport.summary.totalAmount;
   const piutangCount = outstandingReport.summary.transactionCount;
-  const unpaidTransactions = transactions.filter(tx => isUnpaid(tx));
+  const unpaidTransactions = pendingReportTransactions;
   const filterLabel = `Periode: ${periodBounds.label} | Petugas: ${officerFilter === 'all' ? 'Semua Petugas' : officerFilter}`;
   const reportSummaryRows = [
-    ['Total Transaksi', filteredTransactions.length],
+    ['Total Transaksi Sukses', paidReportTransactions.length],
     ['Total Omzet', formatRp(totalOmzet)],
-    ['Total Qty', totalQty],
+    ['Barang Terjual', totalQty],
     ['Total LAZISNU', formatRp(totalLazisnu)],
     ['Total PCNU', formatRp(totalPcnu)],
     ['Total Petugas', formatRp(totalPetugas)],
@@ -4385,7 +4439,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
     ['Tanggal Export', formatDateTimeId(new Date())]
   ];
 
-  const profitRowsByOfficer = Object.values(filteredTransactions.reduce((acc, tx) => {
+  const profitRowsByOfficer = Object.values(paidReportTransactions.reduce((acc, tx) => {
     const officerName = getTransactionOfficerName(tx);
 
     if (!acc[officerName]) {
@@ -4405,7 +4459,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
 
     acc[officerName].transactionCount++;
     acc[officerName].totalQty += getTransactionTotalQty(tx);
-    acc[officerName].totalSales += tx.total || 0;
+    acc[officerName].totalSales += toSafeNumber(tx.total);
     acc[officerName].lazisnuAmount += getTransactionProfitAmount(tx, 'lazisnu');
     acc[officerName].pcnuAmount += getTransactionProfitAmount(tx, 'pcnu');
     acc[officerName].petugasAmount += getTransactionProfitAmount(tx, 'petugas');
@@ -4430,7 +4484,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
       }
     : null;
 
-  const historyExportRows = filteredTransactions.flatMap(tx => getTransactionItems(tx).map(item => ({
+  const historyExportRows = paidReportTransactions.flatMap(tx => getTransactionItems(tx).map(item => ({
     'No. Transaksi': tx.id,
     Tanggal: formatDateTimeId(tx.date),
     Pembeli: tx.buyerName || 'Hamba Allah',
@@ -4491,7 +4545,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
   ];
   const outstandingSummaryRows = [
     ['Total Uang di Luar', formatRp(outstandingReport.summary.totalAmount)],
-    ['Jumlah Transaksi Belum Lunas', outstandingReport.summary.transactionCount],
+    ['Jumlah Transaksi Pending/Piutang', outstandingReport.summary.transactionCount],
     ['Total Qty Barang Piutang', outstandingReport.summary.totalQty],
     ['Jumlah Pengutang', outstandingReport.summary.debtorCount],
     ['Tanggal Export', formatDateTimeId(new Date())]
@@ -4503,7 +4557,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
     debt: outstandingExportRows
   };
   const titleByTab = {
-    history: 'Laporan Penjualan LAZISNU Garut',
+    history: 'Laporan Transaksi Sukses LAZISNU Garut',
     profit: 'Laporan Pembagian Laba Petugas',
     stock: 'Laporan Stok Barang Stikernisasi',
     debt: 'Laporan Uang di Luar Stikernisasi'
@@ -4517,7 +4571,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
   const activeExportRows = exportRowsByTab[activeReportTab] || historyExportRows;
   const activeReportTitle = titleByTab[activeReportTab] || titleByTab.history;
   const activeSummaryRows = activeReportTab === 'stock' ? stockSummaryRows : (activeReportTab === 'debt' ? outstandingSummaryRows : reportSummaryRows);
-  const activeDataSheetName = activeReportTab === 'history' ? 'Riwayat Transaksi' : (activeReportTab === 'profit' ? 'Laba Petugas' : (activeReportTab === 'stock' ? 'Stok Barang' : 'Uang di Luar'));
+  const activeDataSheetName = activeReportTab === 'history' ? 'Transaksi Sukses' : (activeReportTab === 'profit' ? 'Laba Petugas' : (activeReportTab === 'stock' ? 'Stok Barang' : 'Uang di Luar'));
   const filePrefix = filePrefixByTab[activeReportTab] || filePrefixByTab.history;
   const filePeriodPart = getPeriodFilePart(periodFilter, customStartDate, customEndDate);
 
@@ -4620,7 +4674,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
       setTransactions(refreshed.data);
       setTransactionSource(refreshed.source === 'database' ? 'Database' : 'Lokal');
       setConfirmMarkPaid(null);
-      showToast('Piutang berhasil ditandai lunas.', 'success');
+      showToast('Piutang berhasil dikonfirmasi lunas dan masuk omzet.', 'success');
     } catch (err) {
       showToast(err.message || 'Gagal menandai piutang lunas.', 'error');
     } finally {
@@ -4633,7 +4687,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
       <header className="flex flex-col lg:flex-row justify-between lg:items-end gap-4 px-1 md:px-0">
         <div>
           <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">Laporan & Laba</h1>
-          <p className="text-sm text-slate-500 mt-1.5">Pantau riwayat transaksi dan bagi hasil.</p>
+          <p className="text-sm text-slate-500 mt-1.5">Omzet, laba, dan barang terjual hanya menghitung transaksi lunas.</p>
           <p className="text-xs font-bold text-emerald-600 dark:text-emerald-400 mt-2">Sumber Transaksi: {transactionSource}</p>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 w-full lg:w-auto">
@@ -4651,7 +4705,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
           <select value={paymentFilter} onChange={e => setPaymentFilter(e.target.value)} className="bg-white dark:bg-[#0a0f1c] border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 min-h-[44px] text-sm font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus:border-emerald-500">
             <option value="all">Semua Pembayaran</option>
             <option value="paid">Lunas</option>
-            <option value="unpaid">Belum Lunas</option>
+            <option value="unpaid">Pending/Piutang</option>
           </select>
           <Button type="button" variant="secondary" onClick={handleExportExcel} className="px-4 py-3 min-h-[44px] text-sm shadow-none"><Download size={16} /> Excel</Button>
           <Button type="button" variant="secondary" onClick={handleExportPdf} className="px-4 py-3 min-h-[44px] text-sm shadow-none"><Download size={16} /> PDF</Button>
@@ -4666,7 +4720,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
       )}
 
       <div className="flex gap-6 border-b border-slate-200 dark:border-slate-800 overflow-x-auto">
-        <button type="button" onClick={() => setActiveReportTab('history')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 ${activeReportTab === 'history' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Riwayat Transaksi</button>
+        <button type="button" onClick={() => setActiveReportTab('history')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 ${activeReportTab === 'history' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Transaksi Sukses</button>
         <button type="button" onClick={() => setActiveReportTab('profit')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 ${activeReportTab === 'profit' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Pembagian Laba Petugas</button>
         <button type="button" onClick={() => setActiveReportTab('stock')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 whitespace-nowrap ${activeReportTab === 'stock' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Stok Barang</button>
         <button type="button" onClick={() => setActiveReportTab('debt')} className={`pb-3 text-sm font-extrabold transition-colors border-b-2 whitespace-nowrap ${activeReportTab === 'debt' ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'}`}>Piutang</button>
@@ -4679,7 +4733,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
           <p className="text-sm text-slate-500 mt-1">Ringkasan internal berdasarkan filter laporan.</p>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-          <Card className="bg-slate-50 dark:bg-[#111828]"><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total Omzet</p><p className="text-2xl font-black text-slate-900 dark:text-white">{formatRp(totalOmzet)}</p></Card>
+          <Card className="bg-slate-50 dark:bg-[#111828]"><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total Omzet Lunas</p><p className="text-2xl font-black text-slate-900 dark:text-white">{formatRp(totalOmzet)}</p></Card>
           <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total LAZISNU</p><p className="text-2xl font-black text-emerald-600 dark:text-emerald-500">{formatRp(totalLazisnu)}</p></Card>
           <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total PCNU</p><p className="text-2xl font-black text-slate-900 dark:text-white">{formatRp(totalPcnu)}</p></Card>
           <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total Petugas</p><p className="text-2xl font-black text-slate-900 dark:text-white">{formatRp(totalPetugas)}</p></Card>
@@ -4831,10 +4885,10 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
                   <td className="p-4 font-extrabold text-slate-900 dark:text-slate-100">{tx.buyerName || 'Hamba Allah'}</td>
                   <td className="p-4"><span className="font-bold text-slate-900 dark:text-slate-100">{getTransactionProductSummary(tx)}</span><div className="mt-1 text-xs font-semibold text-slate-500">Qty {getTransactionTotalQty(tx)}</div></td>
                   <td className="p-4 font-black text-red-600 dark:text-red-400">{formatRp(getRemainingAmount(tx))}</td>
-                  <td className="p-4"><span className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider rounded-lg ${getPaymentStatusColor(tx)}`}>{getPaymentStatusLabel(tx)}</span></td>
+                  <td className="p-4"><span className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider rounded-lg ${getPaymentStatusColor(tx)}`}>Pending</span></td>
                   <td className="p-4 text-center">
                     <div className="flex flex-wrap justify-center gap-2">
-                      <Button variant="secondary" className="px-4 py-2 min-h-[40px] text-xs shadow-none border-slate-200 dark:border-slate-700" onClick={() => setConfirmMarkPaid(tx)}><CheckCircle2 size={16} className="mr-2" /> Tandai Lunas</Button>
+                      <Button variant="secondary" className="px-4 py-2 min-h-[40px] text-xs shadow-none border-slate-200 dark:border-slate-700" onClick={() => setConfirmMarkPaid(tx)}><CheckCircle2 size={16} className="mr-2" /> Konfirmasi Lunas</Button>
                       <Button variant="secondary" className="px-4 py-2 min-h-[40px] text-xs shadow-none border-slate-200 dark:border-slate-700" onClick={() => handleViewInvoice(tx)}><Receipt size={16} className="mr-2" /> Lihat Struk</Button>
                     </div>
                   </td>
@@ -4849,9 +4903,9 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
 
       {activeReportTab === 'history' && <>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total Transaksi</p><p className="text-2xl font-black text-slate-900 dark:text-white">{filteredTransactions.length}</p></Card>
-        <Card className="bg-emerald-50 dark:bg-emerald-900/10 border-emerald-100 dark:border-emerald-800/50"><p className="text-xs font-bold uppercase text-emerald-700 dark:text-emerald-400 mb-1">Total Omzet</p><p className="text-2xl font-black text-emerald-600 dark:text-emerald-500">{formatRp(totalOmzet)}</p></Card>
-        <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Total Qty</p><p className="text-2xl font-black text-slate-900 dark:text-white">{totalQty}</p></Card>
+        <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Transaksi Sukses</p><p className="text-2xl font-black text-slate-900 dark:text-white">{paidReportTransactions.length}</p></Card>
+        <Card className="bg-emerald-50 dark:bg-emerald-900/10 border-emerald-100 dark:border-emerald-800/50"><p className="text-xs font-bold uppercase text-emerald-700 dark:text-emerald-400 mb-1">Omzet Lunas</p><p className="text-2xl font-black text-emerald-600 dark:text-emerald-500">{formatRp(totalOmzet)}</p></Card>
+        <Card><p className="text-xs font-bold uppercase text-slate-500 mb-1">Barang Terjual</p><p className="text-2xl font-black text-slate-900 dark:text-white">{totalQty}</p></Card>
         <Card className={pendingSyncCount > 0 ? 'border-amber-200 bg-amber-50 dark:border-amber-500/20 dark:bg-[#111828]' : ''}><p className="text-xs font-bold uppercase text-slate-500 mb-1">Belum Sync</p><p className="text-2xl font-black text-slate-900 dark:text-white">{pendingSyncCount}</p></Card>
       </div>
 
@@ -4868,7 +4922,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
-              {filteredTransactions.map(t => (
+              {paidReportTransactions.map(t => (
                 <tr key={t.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/20 transition-colors">
                   <td className="p-4 text-slate-600 dark:text-slate-300 font-medium">{new Date(t.date).toLocaleDateString('id-ID', {day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'})}</td>
                   <td className="p-4 text-slate-600 dark:text-slate-300 font-bold">{getTransactionOfficerName(t)}</td>
@@ -4890,7 +4944,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
                   </td>
                 </tr>
               ))}
-              {filteredTransactions.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-slate-500 font-medium">Tidak ada data.</td></tr>}
+              {paidReportTransactions.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-slate-500 font-medium">Tidak ada transaksi sukses.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -4902,8 +4956,8 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
           <Card className="w-full max-w-md shadow-2xl rounded-b-none md:rounded-2xl animate-fade-in-up">
             <div className="flex justify-between items-start gap-4 mb-5">
               <div>
-                <h2 className="text-2xl font-extrabold tracking-tight">Tandai Piutang Lunas?</h2>
-                <p className="text-sm text-slate-500 mt-1">Status transaksi akan berubah menjadi Lunas.</p>
+                <h2 className="text-2xl font-extrabold tracking-tight">Konfirmasi Piutang Lunas?</h2>
+                <p className="text-sm text-slate-500 mt-1">Status transaksi akan berubah menjadi Lunas dan masuk omzet.</p>
               </div>
               <button onClick={() => setConfirmMarkPaid(null)} className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-100 dark:bg-slate-800 rounded-full shrink-0"><X size={22} /></button>
             </div>
@@ -4913,7 +4967,7 @@ const ReportsView = ({ setView, setInvoiceData, setInvoiceBackView, showToast })
             </div>
             <div className="flex gap-3">
               <Button type="button" variant="secondary" className="flex-1" onClick={() => setConfirmMarkPaid(null)}>Batal</Button>
-              <Button type="button" className="flex-1" isLoading={isMarkingPaid} onClick={handleConfirmMarkPaid}>Tandai Lunas</Button>
+              <Button type="button" className="flex-1" isLoading={isMarkingPaid} onClick={handleConfirmMarkPaid}>Konfirmasi Lunas</Button>
             </div>
           </Card>
         </div>

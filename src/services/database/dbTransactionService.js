@@ -14,16 +14,21 @@ const normalizePaymentStatus = (status) => ['paid', 'unpaid', 'partial'].include
   ? String(status || '').toLowerCase()
   : 'paid';
 
+const toSafeNumber = (value) => {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number : 0;
+};
+
 const getPaymentAmounts = ({ paymentStatus, total, paidAmount, remainingAmount }) => {
   const status = normalizePaymentStatus(paymentStatus);
-  const safeTotal = Number(total || 0);
+  const safeTotal = toSafeNumber(total);
 
   if (status === 'paid') return { paidAmount: safeTotal, remainingAmount: 0 };
   if (status === 'unpaid') return { paidAmount: 0, remainingAmount: safeTotal };
 
-  const safePaidAmount = Math.max(0, Number(paidAmount ?? 0));
+  const safePaidAmount = Math.max(0, toSafeNumber(paidAmount));
   const safeRemainingAmount = remainingAmount !== undefined && remainingAmount !== null
-    ? Math.max(0, Number(remainingAmount || 0))
+    ? Math.max(0, toSafeNumber(remainingAmount))
     : Math.max(0, safeTotal - safePaidAmount);
 
   return { paidAmount: safePaidAmount, remainingAmount: safeRemainingAmount };
@@ -38,15 +43,15 @@ const getTransactionItems = (tx) => {
     productNameSnapshot: tx.productNameSnapshot || tx.product_name_snapshot || tx.productName || tx.name || '-',
     productCategorySnapshot: tx.productCategorySnapshot || tx.product_category_snapshot || tx.productCategory || tx.category || '-',
     productSizeSnapshot: tx.productSizeSnapshot || tx.product_size_snapshot || tx.productSize || tx.size || '-',
-    priceSnapshot: Number(tx.priceSnapshot ?? tx.price_snapshot ?? tx.price ?? 0),
-    qty: Number(tx.qty || tx.quantity || 0),
-    subtotal: Number(tx.total || ((tx.priceSnapshot ?? tx.price_snapshot ?? tx.price ?? 0) * (tx.qty || tx.quantity || 0)))
+    priceSnapshot: toSafeNumber(tx.priceSnapshot ?? tx.price_snapshot ?? tx.price),
+    qty: toSafeNumber(tx.qty || tx.quantity),
+    subtotal: toSafeNumber(tx.total || (toSafeNumber(tx.priceSnapshot ?? tx.price_snapshot ?? tx.price) * toSafeNumber(tx.qty || tx.quantity)))
   }];
 };
 
 const mapDbItemToUi = (item) => {
-  const price = Number(item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0);
-  const qty = Number(item.qty || item.quantity || 0);
+  const price = toSafeNumber(item.priceSnapshot ?? item.price_snapshot ?? item.price);
+  const qty = toSafeNumber(item.qty || item.quantity);
 
   return {
     id: item.id || item.dbId || item.productId || item.product_id || null,
@@ -57,7 +62,7 @@ const mapDbItemToUi = (item) => {
     productSizeSnapshot: item.productSizeSnapshot || item.product_size_snapshot || item.size || item.productSize || '-',
     priceSnapshot: price,
     qty,
-    subtotal: Number(item.subtotal ?? (price * qty)),
+    subtotal: toSafeNumber(item.subtotal ?? (price * qty)),
     createdAt: item.createdAt || item.created_at || null
   };
 };
@@ -66,13 +71,13 @@ export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
   const items = (itemRows || transactionRow.transaction_items || []).map(mapDbItemToUi);
   const firstItem = items[0] || {};
   const paymentStatus = normalizePaymentStatus(transactionRow.payment_status);
-  const total = Number(transactionRow.total || 0);
+  const total = toSafeNumber(transactionRow.total);
   const fallbackAmounts = getPaymentAmounts({ paymentStatus, total });
   const paidAmount = transactionRow.paid_amount !== undefined && transactionRow.paid_amount !== null
-    ? Number(transactionRow.paid_amount || 0)
+    ? toSafeNumber(transactionRow.paid_amount)
     : fallbackAmounts.paidAmount;
   const remainingAmount = transactionRow.remaining_amount !== undefined && transactionRow.remaining_amount !== null
-    ? Number(transactionRow.remaining_amount || 0)
+    ? toSafeNumber(transactionRow.remaining_amount)
     : getPaymentAmounts({ paymentStatus, total, paidAmount }).remainingAmount;
 
   return {
@@ -92,21 +97,21 @@ export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
     productSizeSnapshot: firstItem.productSizeSnapshot || '-',
     price: firstItem.priceSnapshot || 0,
     priceSnapshot: firstItem.priceSnapshot || 0,
-    qty: items.reduce((sum, item) => sum + Number(item.qty || 0), 0),
+    qty: items.reduce((sum, item) => sum + toSafeNumber(item.qty), 0),
     items,
     total,
     paymentMethod: transactionRow.payment_method || 'Tunai',
     notes: transactionRow.notes || '',
     syncStatus: transactionRow.sync_status || 'pending',
     syncedAt: transactionRow.synced_at || null,
-    lazisnuPercentSnapshot: Number(transactionRow.lazisnu_percent_snapshot ?? 30),
-    pcnuPercentSnapshot: Number(transactionRow.pcnu_percent_snapshot ?? 30),
-    petugasPercentSnapshot: Number(transactionRow.petugas_percent_snapshot ?? 30),
-    pengelolaPercentSnapshot: Number(transactionRow.pengelola_percent_snapshot ?? 10),
-    lazisnuAmount: Number(transactionRow.lazisnu_amount || 0),
-    pcnuAmount: Number(transactionRow.pcnu_amount || 0),
-    petugasAmount: Number(transactionRow.petugas_amount || 0),
-    pengelolaAmount: Number(transactionRow.pengelola_amount || 0),
+    lazisnuPercentSnapshot: toSafeNumber(transactionRow.lazisnu_percent_snapshot ?? 30),
+    pcnuPercentSnapshot: toSafeNumber(transactionRow.pcnu_percent_snapshot ?? 30),
+    petugasPercentSnapshot: toSafeNumber(transactionRow.petugas_percent_snapshot ?? 30),
+    pengelolaPercentSnapshot: toSafeNumber(transactionRow.pengelola_percent_snapshot ?? 10),
+    lazisnuAmount: toSafeNumber(transactionRow.lazisnu_amount),
+    pcnuAmount: toSafeNumber(transactionRow.pcnu_amount),
+    petugasAmount: toSafeNumber(transactionRow.petugas_amount),
+    pengelolaAmount: toSafeNumber(transactionRow.pengelola_amount),
     createdAt: transactionRow.created_at || null,
     updatedAt: transactionRow.updated_at || null,
     // -- Piutang fields --
@@ -121,7 +126,7 @@ export const mapTransactionFromDb = (transactionRow, itemRows = []) => {
 
 export const mapTransactionToDb = (transaction, userIdByLocalId = new Map()) => {
   const paymentStatus = normalizePaymentStatus(transaction.paymentStatus);
-  const total = Number(transaction.total || 0);
+  const total = toSafeNumber(transaction.total);
   const amounts = getPaymentAmounts({
     paymentStatus,
     total,
@@ -141,14 +146,14 @@ export const mapTransactionToDb = (transaction, userIdByLocalId = new Map()) => 
     notes: transaction.notes || '',
     sync_status: transaction.syncStatus || 'pending',
     synced_at: transaction.syncedAt || null,
-    lazisnu_percent_snapshot: Number(transaction.lazisnuPercentSnapshot ?? 30),
-    pcnu_percent_snapshot: Number(transaction.pcnuPercentSnapshot ?? 30),
-    petugas_percent_snapshot: Number(transaction.petugasPercentSnapshot ?? 30),
-    pengelola_percent_snapshot: Number(transaction.pengelolaPercentSnapshot ?? 10),
-    lazisnu_amount: Number(transaction.lazisnuAmount || 0),
-    pcnu_amount: Number(transaction.pcnuAmount || 0),
-    petugas_amount: Number(transaction.petugasAmount || 0),
-    pengelola_amount: Number(transaction.pengelolaAmount || 0),
+    lazisnu_percent_snapshot: toSafeNumber(transaction.lazisnuPercentSnapshot ?? 30),
+    pcnu_percent_snapshot: toSafeNumber(transaction.pcnuPercentSnapshot ?? 30),
+    petugas_percent_snapshot: toSafeNumber(transaction.petugasPercentSnapshot ?? 30),
+    pengelola_percent_snapshot: toSafeNumber(transaction.pengelolaPercentSnapshot ?? 10),
+    lazisnu_amount: toSafeNumber(transaction.lazisnuAmount),
+    pcnu_amount: toSafeNumber(transaction.pcnuAmount),
+    petugas_amount: toSafeNumber(transaction.petugasAmount),
+    pengelola_amount: toSafeNumber(transaction.pengelolaAmount),
     created_at: transaction.createdAt || transaction.date || new Date().toISOString(),
     updated_at: new Date().toISOString(),
     // -- Piutang fields --
@@ -167,9 +172,9 @@ export const mapTransactionItemToDb = (item, transactionId, productIdByLocalId =
   product_name_snapshot: item.productNameSnapshot || item.product_name_snapshot || item.name || item.productName || '-',
   product_category_snapshot: item.productCategorySnapshot || item.product_category_snapshot || item.category || item.productCategory || '-',
   product_size_snapshot: item.productSizeSnapshot || item.product_size_snapshot || item.size || item.productSize || '-',
-  price_snapshot: Number(item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0),
-  qty: Number(item.qty || item.quantity || 0),
-  subtotal: Number(item.subtotal ?? ((item.priceSnapshot ?? item.price_snapshot ?? item.price ?? 0) * (item.qty || item.quantity || 0)))
+  price_snapshot: toSafeNumber(item.priceSnapshot ?? item.price_snapshot ?? item.price),
+  qty: toSafeNumber(item.qty || item.quantity),
+  subtotal: toSafeNumber(item.subtotal ?? (toSafeNumber(item.priceSnapshot ?? item.price_snapshot ?? item.price) * toSafeNumber(item.qty || item.quantity)))
 });
 
 export const mapTransactionToUiCache = (transaction) => ({ ...transaction });
@@ -297,9 +302,9 @@ export async function updateTransactionInDb(transactionId, payload) {
       ...(payload.syncStatus !== undefined || payload.sync_status !== undefined ? { sync_status: payload.syncStatus ?? payload.sync_status } : {}),
       ...(payload.syncedAt !== undefined || payload.synced_at !== undefined ? { synced_at: payload.syncedAt ?? payload.synced_at } : {}),
       ...(payload.notes !== undefined ? { notes: payload.notes } : {}),
-      ...(payload.paymentStatus !== undefined || payload.payment_status !== undefined ? { payment_status: payload.paymentStatus ?? payload.payment_status } : {}),
-      ...(payload.paidAmount !== undefined || payload.paid_amount !== undefined ? { paid_amount: Number(payload.paidAmount ?? payload.paid_amount ?? 0) } : {}),
-      ...(payload.remainingAmount !== undefined || payload.remaining_amount !== undefined ? { remaining_amount: Number(payload.remainingAmount ?? payload.remaining_amount ?? 0) } : {}),
+      ...(payload.paymentStatus !== undefined || payload.payment_status !== undefined ? { payment_status: normalizePaymentStatus(payload.paymentStatus ?? payload.payment_status) } : {}),
+      ...(payload.paidAmount !== undefined || payload.paid_amount !== undefined ? { paid_amount: toSafeNumber(payload.paidAmount ?? payload.paid_amount) } : {}),
+      ...(payload.remainingAmount !== undefined || payload.remaining_amount !== undefined ? { remaining_amount: toSafeNumber(payload.remainingAmount ?? payload.remaining_amount) } : {}),
       ...(payload.debtDueDate !== undefined || payload.debt_due_date !== undefined ? { debt_due_date: payload.debtDueDate ?? payload.debt_due_date } : {}),
       ...(payload.debtPaidAt !== undefined || payload.debt_paid_at !== undefined ? { debt_paid_at: payload.debtPaidAt ?? payload.debt_paid_at } : {}),
       ...(payload.debtNote !== undefined || payload.debt_note !== undefined ? { debt_note: payload.debtNote ?? payload.debt_note } : {}),
